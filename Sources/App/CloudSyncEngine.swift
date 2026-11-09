@@ -10,6 +10,7 @@ struct CloudTabRecord {
     var languageLocked: Bool
     var lastModified: Date
     var headVersionID: String? = nil
+    var fastForwardFromID: String? = nil
     var deletedAt: Date? = nil
     var deletedOn: String? = nil
 }
@@ -267,15 +268,20 @@ final class CloudSyncEngine: @unchecked Sendable {
         let store = TabStore.shared
         guard let tab = (store.tabs + store.trashedTabs).first(where: { $0.id == id && $0.fileURL == nil }) else { return nil }
         let record = cachedRecord(for: recordID, recordType: RecordType.scratchTab.rawValue)
+        Self.fill(record, from: tab)
+        return record
+    }
+
+    static func fill(_ record: CKRecord, from tab: TabData) {
         record["name"] = tab.name as CKRecordValue
         record["content"] = tab.content as CKRecordValue
         record["language"] = tab.language as CKRecordValue
         record["languageLocked"] = (tab.languageLocked ? 1 : 0) as CKRecordValue
         record["lastModified"] = tab.lastModified as CKRecordValue
         record["headVersionID"] = tab.headVersionID.map { $0 as CKRecordValue }
+        record["fastForwardFromID"] = tab.pendingFastForwardID.map { $0 as CKRecordValue }
         record["deletedAt"] = tab.deletedAt.map { $0 as CKRecordValue }
         record["deletedOn"] = tab.deletedOn.map { $0 as CKRecordValue }
-        return record
     }
 
     private func buildClipboardEntryRecord(id: UUID, recordID: CKRecord.ID) -> CKRecord? {
@@ -371,6 +377,7 @@ final class CloudSyncEngine: @unchecked Sendable {
             languageLocked: (record["languageLocked"] as? Int64 ?? 0) != 0,
             lastModified: lastModified,
             headVersionID: record["headVersionID"] as? String,
+            fastForwardFromID: record["fastForwardFromID"] as? String,
             deletedAt: record["deletedAt"] as? Date,
             deletedOn: record["deletedOn"] as? String
         )

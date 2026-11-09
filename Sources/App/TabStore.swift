@@ -21,6 +21,10 @@ struct TabData: Identifiable, Equatable {
     /// Latest version appended for the live text – tells other devices what
     /// our content descends from so they can fast-forward or find a merge base.
     var headVersionID: String?
+    /// Set after a kept-local conflict: the version id of the remote text we
+    /// parked. Pushed as `fastForwardFromID` so the other device adopts our
+    /// text while its live text is still that version; cleared once it does.
+    var pendingFastForwardID: String?
     var deletedAt: Date?
     var deletedOn: String?
     /// Local only: a remote edit could not be merged and was kept as a version.
@@ -38,6 +42,7 @@ struct TabData: Identifiable, Equatable {
         cursorPosition: Int = 0,
         lastModified: Date = Date(),
         headVersionID: String? = nil,
+        pendingFastForwardID: String? = nil,
         deletedAt: Date? = nil,
         deletedOn: String? = nil,
         hasConflict: Bool = false
@@ -53,6 +58,7 @@ struct TabData: Identifiable, Equatable {
         self.cursorPosition = cursorPosition
         self.lastModified = lastModified
         self.headVersionID = headVersionID
+        self.pendingFastForwardID = pendingFastForwardID
         self.deletedAt = deletedAt
         self.deletedOn = deletedOn
         self.hasConflict = hasConflict
@@ -73,6 +79,7 @@ extension TabData: Codable {
         cursorPosition = try c.decode(Int.self, forKey: .cursorPosition)
         lastModified = try c.decodeIfPresent(Date.self, forKey: .lastModified) ?? .distantPast
         headVersionID = try c.decodeIfPresent(String.self, forKey: .headVersionID)
+        pendingFastForwardID = try c.decodeIfPresent(String.self, forKey: .pendingFastForwardID)
         deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
         deletedOn = try c.decodeIfPresent(String.self, forKey: .deletedOn)
         hasConflict = try c.decodeIfPresent(Bool.self, forKey: .hasConflict) ?? false
@@ -485,6 +492,7 @@ class TabStore: ObservableObject {
         setContentExternally(id: id, content: version.text, cursor: version.text.utf16.count)
         versionTracking[id, default: VersionTracking()].latestText = version.text
         setHeadVersion(id: id, versionID: version.id)
+        clearFastForwardMarker(at: tabs.firstIndex { $0.id == id })
         resolveConflict(id: id)
     }
 
@@ -832,6 +840,13 @@ class TabStore: ObservableObject {
             return
         }
 
+        if let pending = tabs[localIndex].pendingFastForwardID,
+           data.content == tabs[localIndex].content || (data.headVersionID != nil && data.headVersionID != pending) {
+            // The other device adopted our text or moved on from the parked
+            // copy: either way the hint is stale
+            clearFastForwardMarker(at: localIndex)
+        }
+
         if tabs[localIndex].content == data.content {
             // lastModified is only a hint, but with identical text it is the
             // one ordering we have for a rename or language change
@@ -900,9 +915,10 @@ class TabStore: ObservableObject {
         let remoteID = TabVersion.makeID(tabID: id, text: data.content)
         let remoteDevice = knownRemoteDevice(versionIDs: [remoteID, data.headVersionID])
         let syncable = versionSyncPolicy(tabs[index])
-        // The remote text descends from ours when its head is our text's id;
-        // a blank tab with no history is a fresh tab that simply adopts it
-        let fastForward = data.headVersionID == localID
+        // The remote text descends from ours when its head is our text's id,
+        // or the other device kept its text over ours and says so with the
+        // hint; a blank tab with no history is a fresh tab that simply adopts it
+        let fastForward = data.headVersionID == localID || data.fastForwardFromID == localID
         let fresh = localText.isEmpty && versionStore.versions(for: id).isEmpty
 
         // Snapshot before anything else: the local text must survive as a
@@ -967,9 +983,10 @@ class TabStore: ObservableObject {
            versionStore.version(withID: remoteID)?.label?.isEmpty != false {
             versionStore.setLabel(label, versionID: remoteID, tabID: id, syncable: syncable)
         }
-        // Head = the remote text's version: the other device sees its own
-        // text as our ancestor and fast-forwards to ours instead of fighting
-        tabs[index].headVersionID = copy.id
+        // The head stays our text's version (pure lineage); the hint tells the
+        // other device to fast-forward to ours while it still shows the parked
+        // text, and survives our later snapshots until it does
+        tabs[index].pendingFastForwardID = copy.id
         tabs[index].hasConflict = true
         tabs[index].lastModified = max(tabs[index].lastModified, data.lastModified)
         if tabs[index].fileURL == nil {
@@ -989,6 +1006,16 @@ class TabStore: ObservableObject {
         tabs[index].isDirty = true
         tabs[index].headVersionID = headVersionID
         versionTracking[id, default: VersionTracking()].latestText = text
+    }
+
+    /// The hint travels on the ScratchTab record, so dropping it is a push.
+    private func clearFastForwardMarker(at index: Int?) {
+        guard let index, tabs[index].pendingFastForwardID != nil else { return }
+        tabs[index].pendingFastForwardID = nil
+        if tabs[index].fileURL == nil {
+            cloudHooks.recordChanged(tabs[index].id)
+        }
+        scheduleSave()
     }
 
     /// The device that wrote the remote text: the first of the given versions

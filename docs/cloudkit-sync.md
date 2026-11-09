@@ -12,7 +12,7 @@ Both the macOS and iOS itsypad apps sync data via CloudKit using `CKSyncEngine` 
 
 | Record type | Fields | Notes |
 |---|---|---|
-| `ScratchTab` | `name` (String), `content` (String), `language` (String), `languageLocked` (Int64, 0/1), `lastModified` (Date), `headVersionID` (String, optional – id of the latest `TabVersion` the device appended for its live text), `deletedAt` (Date, optional), `deletedOn` (String, optional – device name) | recordName = tab UUID. `lastModified` is a display hint only; `headVersionID` drives conflict handling. A record with `deletedAt` is a tab in the trash; a CloudKit deletion of the record is a hard delete |
+| `ScratchTab` | `name` (String), `content` (String), `language` (String), `languageLocked` (Int64, 0/1), `lastModified` (Date), `headVersionID` (String, optional – id of the latest `TabVersion` the device appended for its live text), `fastForwardFromID` (String, optional – after a kept-local conflict, the id of the remote text that was parked: a device whose live text is still that version adopts the record's content), `deletedAt` (Date, optional), `deletedOn` (String, optional – device name) | recordName = tab UUID. `lastModified` is a display hint only; `headVersionID` drives conflict handling. A record with `deletedAt` is a tab in the trash; a CloudKit deletion of the record is a hard delete |
 | `ClipboardEntry` | `text` (String), `timestamp` (Date) | recordName = entry UUID |
 | `TabVersion` | `tabID` (String, tab UUID), `parentID` (String, optional), `createdAt` (Date), `device` (String), `label` (String, optional), `text` (String), `source` (String: `edit`, `paste`, `conflict`, `manual`, `restore`) | recordName = version id = lowercase hex SHA-256 of `tabID.uuidString + "\n" + text`. No `CKRecord.Reference` – closing a tab deletes its versions explicitly. Immutable, server wins on conflict |
 
@@ -99,9 +99,9 @@ struct CloudClipboardRecord {
 **Tabs (snapshot, merge, keep both):** a fetched record and a `serverRecordChanged` push failure take the same path (`TabStore.applyCloudTab`):
 1. Same text on both sides: only name/language move (newer `lastModified` wins)
 2. Otherwise the local text is appended as a version first – remote content never overwrites unsnapshotted text
-3. Fast-forward: the record's `headVersionID` equals the version id of the local text → remote text becomes live and is stored as a version
+3. Fast-forward: the record's `headVersionID` or `fastForwardFromID` equals the version id of the local text → remote text becomes live and is stored as a version
 4. Else the merge base is the newest version in the remote head's parent chain that the local text also descends from; `LineDiff.merge3` applies both sides' non-overlapping line hunks. A clean merge becomes live, is stored as a version and re-pushed when it differs from the server text
-5. Overlapping hunks or no common ancestor: local text stays live, the remote text is stored as a `conflict` version labelled "Conflict – <device> <time>", the tab shows a conflict badge until resolved, and the local text is re-pushed so it wins on the server too (the remote text survives in history on every device because versions sync)
+5. Overlapping hunks or no common ancestor: local text stays live, the remote text is stored as a `conflict` version labelled "Conflict – <device> <time>", the tab shows a conflict badge until resolved, and the local text is re-pushed so it wins on the server too (the remote text survives in history on every device because versions sync). `headVersionID` stays the id of the local text; the parked copy's id is pushed as `fastForwardFromID` (kept across later local snapshots) until a record from the other device shows it adopted our text or moved on
 
 `TabVersion` records in a fetch batch are applied before `ScratchTab` records so the merge base is already local.
 
