@@ -7,6 +7,7 @@ class EditorCoordinator: NSObject, UITextViewDelegate {
             if language != oldValue {
                 scheduleHighlightIfNeeded()
                 textView?.applyKeyboardTraits(forLanguage: language)
+                textView?.accessoryBar.refresh()
             }
         }
     }
@@ -409,6 +410,7 @@ class EditorCoordinator: NSObject, UITextViewDelegate {
     func textViewDidChangeSelection(_ textView: UITextView) {
         guard let tv = textView as? EditorTextView else { return }
         tv.onCursorChange?(tv.selectedRange.location)
+        tv.accessoryBar.refresh()
         scrollWrapperToCaret()
 
         // Scroll vertically to keep cursor above keyboard
@@ -421,7 +423,9 @@ class EditorCoordinator: NSObject, UITextViewDelegate {
         guard let tv = textView as? EditorTextView else { return }
         let text = tv.text ?? ""
         pendingLocalEdits += 1
+        tv.textChangeCount += 1
         tv.onTextChange?(text)
+        tv.accessoryBar.refresh()
         scheduleHighlightIfNeeded(text: text)
         updateHorizontalLayout()
         gutterView?.setNeedsDisplay()
