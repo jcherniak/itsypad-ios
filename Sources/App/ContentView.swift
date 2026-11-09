@@ -372,6 +372,25 @@ struct ContentView: View {
                 if let id = tabStore.selectedTabID,
                    let tv = EditorView.textView(for: id) {
                     tv.becomeFirstResponder()
+                    DispatchQueue.main.async { tv.performUndo() }
+                }
+            } label: {
+                Label(String(localized: "menu.edit.undo", defaultValue: "Undo"), systemImage: "arrow.uturn.backward")
+            }
+            Button {
+                if let id = tabStore.selectedTabID,
+                   let tv = EditorView.textView(for: id) {
+                    tv.becomeFirstResponder()
+                    DispatchQueue.main.async { tv.performRedo() }
+                }
+            } label: {
+                Label(String(localized: "menu.edit.redo", defaultValue: "Redo"), systemImage: "arrow.uturn.forward")
+            }
+            Divider()
+            Button {
+                if let id = tabStore.selectedTabID,
+                   let tv = EditorView.textView(for: id) {
+                    tv.becomeFirstResponder()
                     DispatchQueue.main.async { tv.toggleChecklist() }
                 }
             } label: {

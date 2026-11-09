@@ -46,6 +46,10 @@ final class EditorTextView: UITextView {
         return lang == "plain" || lang == "markdown"
     }
 
+    var isProse: Bool { listsAllowed }
+
+    let accessoryBar = EditorAccessoryBar()
+
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)
         commonInit()
@@ -65,6 +69,8 @@ final class EditorTextView: UITextView {
         alwaysBounceVertical = true
         textContainerInset = UIEdgeInsets(top: 12, left: 8, bottom: 12, right: 8)
         isFindInteractionEnabled = true
+        accessoryBar.textView = self
+        inputAccessoryView = accessoryBar
 
         let swipeRight = UISwipeGestureRecognizer(target: self, action: #selector(handleSwipeIndent(_:)))
         swipeRight.direction = .right
@@ -117,6 +123,61 @@ final class EditorTextView: UITextView {
             return
         }
         replace(textRange, withText: string)
+    }
+
+    // MARK: - Undo/redo
+
+    func performUndo() {
+        guard let undoManager, undoManager.canUndo else { return }
+        undoManager.undo()
+        accessoryBar.refresh()
+    }
+
+    func performRedo() {
+        guard let undoManager, undoManager.canRedo else { return }
+        undoManager.redo()
+        accessoryBar.refresh()
+    }
+
+    /// Bumped by EditorCoordinator.textViewDidChange. UITextInput's
+    /// replace(_:withText:) delivers textViewDidChange itself (first
+    /// responder or not); the textStorage fallback does not.
+    var textChangeCount = 0
+
+    /// Undo-registered edit that results in exactly one textViewDidChange.
+    func applyEdit(in range: NSRange, with string: String, selection: NSRange) {
+        let before = textChangeCount
+        replaceTextPreservingUndo(in: range, with: string)
+        selectedRange = selection
+        if textChangeCount == before {
+            delegate?.textViewDidChange?(self)
+        }
+    }
+
+    // MARK: - Markdown shortcuts
+
+    func applyMarkdownEdit(_ edit: MarkdownShortcuts.Edit) {
+        applyEdit(in: edit.range, with: edit.replacement, selection: edit.selection)
+    }
+
+    private func wrapSelection(with marker: String) {
+        guard listsAllowed else { return }
+        applyMarkdownEdit(MarkdownShortcuts.wrap(text: text ?? "", selection: selectedRange, marker: marker))
+    }
+
+    func toggleBold() { wrapSelection(with: MarkdownShortcuts.boldMarker) }
+    func toggleItalic() { wrapSelection(with: MarkdownShortcuts.italicMarker) }
+    func toggleStrikethrough() { wrapSelection(with: MarkdownShortcuts.strikethroughMarker) }
+    func toggleInlineCode() { wrapSelection(with: MarkdownShortcuts.inlineCodeMarker) }
+
+    func toggleHeading() {
+        guard listsAllowed else { return }
+        applyMarkdownEdit(MarkdownShortcuts.toggleHeading(text: text ?? "", selection: selectedRange))
+    }
+
+    func insertLink() {
+        guard listsAllowed else { return }
+        applyMarkdownEdit(MarkdownShortcuts.insertLink(text: text ?? "", selection: selectedRange))
     }
 
     // MARK: - Keyboard traits
@@ -257,6 +318,22 @@ final class EditorTextView: UITextView {
             modifierFlags: .command,
             discoverabilityTitle: "Duplicate line"
         ))
+
+        // Cmd+B / Cmd+I — bold / italic (prose only)
+        if listsAllowed {
+            commands.append(UIKeyCommand(
+                action: #selector(toggleBoldCommand),
+                input: "b",
+                modifierFlags: .command,
+                discoverabilityTitle: String(localized: "editor.accessory.bold", defaultValue: "Bold")
+            ))
+            commands.append(UIKeyCommand(
+                action: #selector(toggleItalicCommand),
+                input: "i",
+                modifierFlags: .command,
+                discoverabilityTitle: String(localized: "editor.accessory.italic", defaultValue: "Italic")
+            ))
+        }
 
         // Cmd+Return — toggle checkbox
         if listsAllowed && SettingsStore.shared.checklistsEnabled {
@@ -442,6 +519,14 @@ final class EditorTextView: UITextView {
 
     @objc func toggleChecklistCommand() {
         toggleChecklist()
+    }
+
+    @objc private func toggleBoldCommand() {
+        toggleBold()
+    }
+
+    @objc private func toggleItalicCommand() {
+        toggleItalic()
     }
 
     @objc private func toggleBulletCommand() {

@@ -291,6 +291,7 @@ struct EditorView: UIViewRepresentable {
                     length: min(selection.length, length - location)
                 )
                 coordinator.rehighlight()
+                textView.accessoryBar.refresh()
             }
         }
 
