@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.0
+
+- Add undo and redo controls and a markdown shortcut bar above the keyboard (heading, bold, italic, strikethrough, inline code, link, lists, indent)
+- Add version history – versions are saved automatically while you type, synced via iCloud, and can be compared as a diff and restored
+- Add auto-paste on open – inserts the clipboard into the current note when Itsypad opens, with a one-tap undo banner
+- Add launch behaviour setting – reopen the last note or start a new note
+
 ## 1.2.1
 
 - Fix tapping to position the cursor always landing on the top line (text container height was zero, collapsing tap hit-testing)
