@@ -12,7 +12,7 @@ Both the macOS and iOS itsypad apps sync data via CloudKit using `CKSyncEngine` 
 
 | Record type | Fields | Notes |
 |---|---|---|
-| `ScratchTab` | `name` (String), `content` (String), `language` (String), `languageLocked` (Int64, 0/1), `lastModified` (Date) | recordName = tab UUID |
+| `ScratchTab` | `name` (String), `content` (String), `language` (String), `languageLocked` (Int64, 0/1), `lastModified` (Date), `headVersionID` (String, optional – id of the latest `TabVersion` the device appended for its live text) | recordName = tab UUID. `lastModified` is a display hint only; `headVersionID` drives conflict handling |
 | `ClipboardEntry` | `text` (String), `timestamp` (Date) | recordName = entry UUID |
 | `TabVersion` | `tabID` (String, tab UUID), `parentID` (String, optional), `createdAt` (Date), `device` (String), `label` (String, optional), `text` (String), `source` (String: `edit`, `paste`, `conflict`, `manual`, `restore`) | recordName = version id = lowercase hex SHA-256 of `tabID.uuidString + "\n" + text`. No `CKRecord.Reference` – closing a tab deletes its versions explicitly. Immutable, server wins on conflict |
 
@@ -96,11 +96,14 @@ struct CloudClipboardRecord {
 
 ### Conflict resolution
 
-**Tabs (last-write-wins):**
-1. Push fails with `serverRecordChanged` error
-2. Compare `lastModified` dates between local and server records
-3. If local is newer: copy local fields onto server record, re-queue push
-4. If server is newer: accept server version, update local store
+**Tabs (snapshot, merge, keep both):** a fetched record and a `serverRecordChanged` push failure take the same path (`TabStore.applyCloudTab`):
+1. Same text on both sides: only name/language move (newer `lastModified` wins)
+2. Otherwise the local text is appended as a version first – remote content never overwrites unsnapshotted text
+3. Fast-forward: the record's `headVersionID` equals the version id of the local text → remote text becomes live and is stored as a version
+4. Else the merge base is the newest version in the remote head's parent chain that the local text also descends from; `LineDiff.merge3` applies both sides' non-overlapping line hunks. A clean merge becomes live, is stored as a version and re-pushed when it differs from the server text
+5. Overlapping hunks or no common ancestor: local text stays live, the remote text is stored as a `conflict` version labelled "Conflict – <device> <time>", the tab shows a conflict badge until resolved, and the local text is re-pushed so it wins on the server too (the remote text survives in history on every device because versions sync)
+
+`TabVersion` records in a fetch batch are applied before `ScratchTab` records so the merge base is already local.
 
 **Clipboard (server-wins):**
 - Clipboard entries are append-only – conflicts are rare

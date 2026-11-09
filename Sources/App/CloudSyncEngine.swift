@@ -9,6 +9,7 @@ struct CloudTabRecord {
     var language: String
     var languageLocked: Bool
     var lastModified: Date
+    var headVersionID: String? = nil
 }
 
 struct CloudClipboardRecord {
@@ -50,9 +51,14 @@ final class CloudSyncEngine: @unchecked Sendable {
 
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.justinc.itsypad", category: "CloudSync")
 
-    init() {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let itsypadDir = appSupport.appendingPathComponent("Itsypad")
+    init(directoryURL: URL? = nil) {
+        let itsypadDir: URL
+        if let directoryURL {
+            itsypadDir = directoryURL
+        } else {
+            let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            itsypadDir = appSupport.appendingPathComponent("Itsypad")
+        }
         try? FileManager.default.createDirectory(at: itsypadDir, withIntermediateDirectories: true)
         stateURL = itsypadDir.appendingPathComponent("cloud-sync-state.data")
         metadataURL = itsypadDir.appendingPathComponent("cloud-record-metadata.json")
@@ -263,6 +269,7 @@ final class CloudSyncEngine: @unchecked Sendable {
         record["language"] = tab.language as CKRecordValue
         record["languageLocked"] = (tab.languageLocked ? 1 : 0) as CKRecordValue
         record["lastModified"] = tab.lastModified as CKRecordValue
+        record["headVersionID"] = tab.headVersionID.map { $0 as CKRecordValue }
         return record
     }
 
@@ -291,9 +298,14 @@ final class CloudSyncEngine: @unchecked Sendable {
 
     private func applyFetchedChanges(_ event: CKSyncEngine.Event.FetchedRecordZoneChanges) {
         logger.debug("applyFetchedChanges: \(event.modifications.count) modifications, \(event.deletions.count) deletions")
-        for modification in event.modifications {
+        // Versions first: a tab's merge base is looked up among local versions,
+        // so the versions in the same batch must be stored before the tab
+        let versionType = RecordType.tabVersion.rawValue
+        let modifications = event.modifications.filter { $0.record.recordType == versionType }
+            + event.modifications.filter { $0.record.recordType != versionType }
+        for modification in modifications {
             let record = modification.record
-                        cacheRecordSystemFields(record)
+            cacheRecordSystemFields(record)
 
             switch record.recordType {
             case RecordType.scratchTab.rawValue:
@@ -330,26 +342,31 @@ final class CloudSyncEngine: @unchecked Sendable {
     }
 
     private func applyScratchTabRecord(_ record: CKRecord) {
-        guard let name = record["name"] as? String,
-              let content = record["content"] as? String,
-              let language = record["language"] as? String,
-              let lastModified = record["lastModified"] as? Date else {
+        guard let tabRecord = Self.tabRecord(from: record) else {
             logger.error("Malformed ScratchTab record: \(record.recordID)")
             return
         }
-        let languageLocked = (record["languageLocked"] as? Int64 ?? 0) != 0
-        guard let uuid = UUID(uuidString: record.recordID.recordName) else { return }
+        logger.debug("applyTab: id=\(tabRecord.id.uuidString.prefix(8))")
+        TabStore.shared.applyCloudTab(tabRecord)
+    }
 
-        let tabRecord = CloudTabRecord(
+    static func tabRecord(from record: CKRecord) -> CloudTabRecord? {
+        guard let name = record["name"] as? String,
+              let content = record["content"] as? String,
+              let language = record["language"] as? String,
+              let lastModified = record["lastModified"] as? Date,
+              let uuid = UUID(uuidString: record.recordID.recordName) else {
+            return nil
+        }
+        return CloudTabRecord(
             id: uuid,
             name: name,
             content: content,
             language: language,
-            languageLocked: languageLocked,
-            lastModified: lastModified
+            languageLocked: (record["languageLocked"] as? Int64 ?? 0) != 0,
+            lastModified: lastModified,
+            headVersionID: record["headVersionID"] as? String
         )
-        logger.debug("applyTab: id=\(uuid.uuidString.prefix(8))")
-        TabStore.shared.applyCloudTab(tabRecord)
     }
 
     private func applyClipboardEntryRecord(_ record: CKRecord) {
@@ -391,29 +408,20 @@ final class CloudSyncEngine: @unchecked Sendable {
 
     // MARK: - Conflict resolution
 
-    /// Returns true when the local version won and must be re-uploaded.
-    /// When the server wins, the record must NOT be re-queued: the server
-    /// content is applied locally, and re-saving would push the stale local
-    /// copy back up with a fresh change tag, reverting the newer server edit.
-    private func resolveTabConflict(local record: CKRecord, server serverRecord: CKRecord) -> Bool {
-        let localModified = record["lastModified"] as? Date ?? .distantPast
-        let serverModified = serverRecord["lastModified"] as? Date ?? .distantPast
-
-        if localModified > serverModified {
-            // Local wins: adopt the server's change tag and re-push local fields
-            serverRecord["name"] = record["name"]
-            serverRecord["content"] = record["content"]
-            serverRecord["language"] = record["language"]
-            serverRecord["languageLocked"] = record["languageLocked"]
-            serverRecord["lastModified"] = record["lastModified"]
-            cacheRecordSystemFields(serverRecord)
-            return true
-        } else {
-            // Server wins: accept server version
-            cacheRecordSystemFields(serverRecord)
-            applyScratchTabRecord(serverRecord)
+    /// The server content goes through the same snapshot/merge/keep-both
+    /// logic as a fetched record, with the server's change tag adopted so the
+    /// next save succeeds. Returns true when the resulting local text differs
+    /// from the server's and must be re-pushed; when they match, re-saving
+    /// would only churn the record.
+    func resolveTabConflict(local record: CKRecord, server serverRecord: CKRecord, tabStore: TabStore = .shared) -> Bool {
+        cacheRecordSystemFields(serverRecord)
+        guard let remote = Self.tabRecord(from: serverRecord) else {
+            logger.error("Malformed ScratchTab record: \(serverRecord.recordID)")
             return false
         }
+        tabStore.applyCloudTab(remote)
+        guard let tab = tabStore.tabs.first(where: { $0.id == remote.id }) else { return false }
+        return tab.content != remote.content
     }
 
     private func resolveClipboardConflict(local record: CKRecord, server serverRecord: CKRecord) {

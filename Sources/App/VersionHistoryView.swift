@@ -16,6 +16,10 @@ struct VersionHistoryView: View {
         versionStore.versions(for: tabID)
     }
 
+    private var hasConflict: Bool {
+        tabStore.tabs.first { $0.id == tabID }?.hasConflict ?? false
+    }
+
     private struct DayGroup: Identifiable {
         let day: Date
         let versions: [TabVersion]
@@ -60,6 +64,15 @@ struct VersionHistoryView: View {
             .navigationTitle(String(localized: "history.title", defaultValue: "Version history"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                if hasConflict {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button {
+                            tabStore.resolveConflict(id: tabID)
+                        } label: {
+                            Label(String(localized: "history.resolve", defaultValue: "Resolve"), systemImage: "checkmark.circle")
+                        }
+                    }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button(String(localized: "common.done", defaultValue: "Done")) { dismiss() }
                 }

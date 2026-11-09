@@ -18,6 +18,13 @@ struct TabData: Identifiable, Equatable {
         return !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
     var lastModified: Date
+    /// Latest version appended for the live text – tells other devices what
+    /// our content descends from so they can fast-forward or find a merge base.
+    var headVersionID: String?
+    var deletedAt: Date?
+    var deletedOn: String?
+    /// Local only: a remote edit could not be merged and was kept as a version.
+    var hasConflict: Bool
 
     init(
         id: UUID = UUID(),
@@ -29,7 +36,11 @@ struct TabData: Identifiable, Equatable {
         languageLocked: Bool = false,
         isDirty: Bool = false,
         cursorPosition: Int = 0,
-        lastModified: Date = Date()
+        lastModified: Date = Date(),
+        headVersionID: String? = nil,
+        deletedAt: Date? = nil,
+        deletedOn: String? = nil,
+        hasConflict: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -41,6 +52,10 @@ struct TabData: Identifiable, Equatable {
         self.isDirty = isDirty
         self.cursorPosition = cursorPosition
         self.lastModified = lastModified
+        self.headVersionID = headVersionID
+        self.deletedAt = deletedAt
+        self.deletedOn = deletedOn
+        self.hasConflict = hasConflict
     }
 }
 
@@ -57,6 +72,10 @@ extension TabData: Codable {
         isDirty = try c.decodeIfPresent(Bool.self, forKey: .isDirty) ?? false
         cursorPosition = try c.decode(Int.self, forKey: .cursorPosition)
         lastModified = try c.decodeIfPresent(Date.self, forKey: .lastModified) ?? .distantPast
+        headVersionID = try c.decodeIfPresent(String.self, forKey: .headVersionID)
+        deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
+        deletedOn = try c.decodeIfPresent(String.self, forKey: .deletedOn)
+        hasConflict = try c.decodeIfPresent(Bool.self, forKey: .hasConflict) ?? false
     }
 }
 
@@ -64,6 +83,8 @@ class TabStore: ObservableObject {
     static let shared = TabStore()
 
     @Published var tabs: [TabData] = []
+    /// Tabs in the trash – never shown as live tabs, persisted with the session.
+    @Published var trashedTabs: [TabData] = []
     @Published var selectedTabID: UUID? {
         didSet {
             if isInitialized, let previous = oldValue, previous != selectedTabID {
@@ -326,6 +347,7 @@ class TabStore: ObservableObject {
         if versionStore.append(held, syncable: versionSyncPolicy(tab)) {
             pruneVersions(id: id, syncable: versionSyncPolicy(tab))
         }
+        setHeadVersion(id: id, versionID: held.id)
     }
 
     func discardHeldSnapshot(id: UUID) {
@@ -355,6 +377,16 @@ class TabStore: ObservableObject {
         commitHeldSnapshot(id: id)
         writeVersion(id: id, text: tab.content, source: .restore)
         setContentExternally(id: id, content: version.text, cursor: version.text.utf16.count)
+        versionTracking[id, default: VersionTracking()].latestText = version.text
+        setHeadVersion(id: id, versionID: version.id)
+        resolveConflict(id: id)
+    }
+
+    /// Clears the conflict badge once the user has looked at the kept copy.
+    func resolveConflict(id: UUID) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }), tabs[index].hasConflict else { return }
+        tabs[index].hasConflict = false
+        scheduleSave()
     }
 
     func setVersionLabel(_ label: String?, versionID: String, tabID: UUID) {
@@ -398,12 +430,29 @@ class TabStore: ObservableObject {
     private func makeVersion(id: UUID, text: String, source: TabVersion.Source) -> TabVersion {
         TabVersion(
             tabID: id,
-            parentID: versionStore.latest(for: id)?.id,
+            parentID: lineageParentID(for: id),
             createdAt: now(),
             device: deviceName,
             text: text,
             source: source
         )
+    }
+
+    /// What the live text descends from: the version of its last snapshot,
+    /// then the persisted head after a relaunch, then the newest version.
+    /// Never blindly the newest – that may be a synced remote version, or the
+    /// remote copy a conflict just stored, and a wrong parent hides the common
+    /// ancestor from the other device's merge.
+    private func lineageParentID(for id: UUID) -> String? {
+        let list = versionStore.versions(for: id)
+        if let text = versionTracking[id]?.latestText {
+            let candidate = TabVersion.makeID(tabID: id, text: text)
+            if list.contains(where: { $0.id == candidate }) { return candidate }
+        }
+        if let head = tabs.first(where: { $0.id == id })?.headVersionID, list.contains(where: { $0.id == head }) {
+            return head
+        }
+        return list.first?.id
     }
 
     private func writeVersion(id: UUID, text: String, source: TabVersion.Source) {
@@ -414,6 +463,19 @@ class TabStore: ObservableObject {
         if versionStore.append(version, syncable: syncable) {
             pruneVersions(id: id, syncable: syncable)
         }
+        setHeadVersion(id: id, versionID: version.id)
+    }
+
+    /// The head travels on the ScratchTab record, so a change is pushed even
+    /// though the content itself did not move.
+    private func setHeadVersion(id: UUID, versionID: String) {
+        guard let index = tabs.firstIndex(where: { $0.id == id }),
+              tabs[index].headVersionID != versionID else { return }
+        tabs[index].headVersionID = versionID
+        if tabs[index].fileURL == nil {
+            CloudSyncEngine.shared.recordChanged(id)
+        }
+        scheduleSave()
     }
 
     private func pruneVersions(id: UUID, syncable: Bool) {
@@ -623,30 +685,16 @@ class TabStore: ObservableObject {
 
     // MARK: - Cloud sync
 
+    /// Remote content never replaces local text that is not in the history.
+    /// With the same text on both sides only the metadata moves; otherwise the
+    /// local text is snapshotted first and the remote text is fast-forwarded,
+    /// three-way merged against the common ancestor version, or – when the
+    /// edits overlap or no ancestor is known – kept as a labelled version
+    /// while the local text stays live and wins on the server too.
     func applyCloudTab(_ data: CloudTabRecord) {
-        var changed = false
+        lastICloudSync = Date()
 
-        if let localIndex = tabs.firstIndex(where: { $0.id == data.id }) {
-            // Only accept cloud version if it's newer than local
-            guard data.lastModified > tabs[localIndex].lastModified else { return }
-            if tabs[localIndex].content != data.content
-                || tabs[localIndex].name != data.name
-                || tabs[localIndex].language != data.language {
-                // Snapshot before overwrite: the local text must survive as a
-                // version before remote content replaces it
-                if tabs[localIndex].content != data.content {
-                    commitHeldSnapshot(id: data.id)
-                    cancelIdleTimer(id: data.id)
-                    writeVersion(id: data.id, text: tabs[localIndex].content, source: .conflict)
-                }
-                tabs[localIndex].content = data.content
-                tabs[localIndex].name = data.name
-                tabs[localIndex].language = data.language
-                tabs[localIndex].languageLocked = data.languageLocked
-                tabs[localIndex].lastModified = data.lastModified
-                changed = true
-            }
-        } else {
+        guard let localIndex = tabs.firstIndex(where: { $0.id == data.id }) else {
             let tab = TabData(
                 id: data.id,
                 name: data.name,
@@ -654,16 +702,164 @@ class TabStore: ObservableObject {
                 language: data.language,
                 languageLocked: data.languageLocked,
                 isDirty: !data.content.isEmpty,
-                lastModified: data.lastModified
+                lastModified: data.lastModified,
+                headVersionID: data.headVersionID
             )
             tabs.append(tab)
-            changed = true
+            scheduleSave()
+            return
         }
 
-        lastICloudSync = Date()
-        if changed {
+        if tabs[localIndex].content == data.content {
+            // lastModified is only a hint, but with identical text it is the
+            // one ordering we have for a rename or language change
+            if data.lastModified >= tabs[localIndex].lastModified {
+                applyRemoteMetadata(data, at: localIndex)
+            }
+            if tabs[localIndex].headVersionID == nil {
+                tabs[localIndex].headVersionID = data.headVersionID
+            }
+            tabs[localIndex].lastModified = max(tabs[localIndex].lastModified, data.lastModified)
             scheduleSave()
+            return
         }
+
+        mergeRemoteContent(data, at: localIndex)
+    }
+
+    private func mergeRemoteContent(_ data: CloudTabRecord, at index: Int) {
+        let id = data.id
+        let localText = tabs[index].content
+        let localID = TabVersion.makeID(tabID: id, text: localText)
+        let remoteID = TabVersion.makeID(tabID: id, text: data.content)
+        let remoteDevice = knownRemoteDevice(versionIDs: [remoteID, data.headVersionID])
+        let syncable = versionSyncPolicy(tabs[index])
+        // The remote text descends from ours when its head is our text's id;
+        // a blank tab with no history is a fresh tab that simply adopts it
+        let fastForward = data.headVersionID == localID
+        let fresh = localText.isEmpty && versionStore.versions(for: id).isEmpty
+
+        // Snapshot before anything else: the local text must survive as a
+        // version whatever happens to the live text below
+        commitHeldSnapshot(id: id)
+        cancelIdleTimer(id: id)
+        if !fresh {
+            writeVersion(id: id, text: localText, source: fastForward ? .edit : .conflict)
+        }
+
+        if fastForward || fresh {
+            let version = TabVersion(
+                tabID: id,
+                parentID: fresh ? (data.headVersionID != remoteID ? data.headVersionID : nil) : localID,
+                createdAt: now(),
+                device: remoteDevice ?? "iCloud",
+                text: data.content,
+                source: .edit
+            )
+            if versionStore.append(version, syncable: syncable) {
+                pruneVersions(id: id, syncable: syncable)
+            }
+            applyRemoteMetadata(data, at: index)
+            setLiveText(id: id, text: data.content, headVersionID: version.id, at: index)
+            tabs[index].lastModified = max(tabs[index].lastModified, data.lastModified)
+            scheduleSave()
+            return
+        }
+
+        if let base = mergeBase(tabID: id, localLatestID: localID, remoteHeadID: data.headVersionID),
+           case .clean(let merged) = LineDiff.merge3(base: base.text, ours: localText, theirs: data.content) {
+            let version = makeVersion(id: id, text: merged, source: .edit)
+            if versionStore.append(version, syncable: syncable) {
+                pruneVersions(id: id, syncable: syncable)
+            }
+            applyRemoteMetadata(data, at: index)
+            setLiveText(id: id, text: merged, headVersionID: version.id, at: index)
+            tabs[index].lastModified = max(tabs[index].lastModified, data.lastModified)
+            if merged != data.content, tabs[index].fileURL == nil {
+                CloudSyncEngine.shared.recordChanged(id)
+            }
+            scheduleSave()
+            return
+        }
+
+        // Keep both: local stays live, the remote text becomes a labelled version
+        let device = remoteDevice
+            ?? String(localized: "history.conflict_device_unknown", defaultValue: "another device")
+        let time = now().formatted(date: .omitted, time: .shortened)
+        let label = String(localized: "history.conflict_label", defaultValue: "Conflict – \(device) \(time)")
+        let remoteParent = data.headVersionID != remoteID ? data.headVersionID : nil
+        let copy = TabVersion(
+            tabID: id,
+            parentID: remoteParent ?? localID,
+            createdAt: now(),
+            device: remoteDevice ?? "iCloud",
+            label: label,
+            text: data.content,
+            source: .conflict
+        )
+        if !versionStore.append(copy, syncable: syncable),
+           versionStore.version(withID: remoteID)?.label?.isEmpty != false {
+            versionStore.setLabel(label, versionID: remoteID, tabID: id, syncable: syncable)
+        }
+        // Head = the remote text's version: the other device sees its own
+        // text as our ancestor and fast-forwards to ours instead of fighting
+        tabs[index].headVersionID = copy.id
+        tabs[index].hasConflict = true
+        tabs[index].lastModified = max(tabs[index].lastModified, data.lastModified)
+        if tabs[index].fileURL == nil {
+            CloudSyncEngine.shared.recordChanged(id)
+        }
+        scheduleSave()
+    }
+
+    private func applyRemoteMetadata(_ data: CloudTabRecord, at index: Int) {
+        tabs[index].name = data.name
+        tabs[index].language = data.language
+        tabs[index].languageLocked = data.languageLocked
+    }
+
+    private func setLiveText(id: UUID, text: String, headVersionID: String, at index: Int) {
+        tabs[index].content = text
+        tabs[index].headVersionID = headVersionID
+        versionTracking[id, default: VersionTracking()].latestText = text
+    }
+
+    /// The device that wrote the remote text: the first of the given versions
+    /// (the remote text's own, then the remote head) that has synced to us and
+    /// was not written by this device – the remote head may well be a version
+    /// of ours that the other device adopted.
+    private func knownRemoteDevice(versionIDs: [String?]) -> String? {
+        for case let id? in versionIDs {
+            if let device = versionStore.version(withID: id)?.device, device != deviceName {
+                return device
+            }
+        }
+        return nil
+    }
+
+    /// The newest version in the remote head's parent chain that the local
+    /// text also descends from – the common ancestor both sides edited from.
+    /// Nil when the remote head is unknown locally or the chains never meet.
+    private func mergeBase(tabID: UUID, localLatestID: String, remoteHeadID: String?) -> TabVersion? {
+        guard let remoteHeadID else { return nil }
+        let known = Dictionary(versionStore.versions(for: tabID).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+
+        var ours = Set<String>()
+        var cursor: String? = localLatestID
+        while let id = cursor, !ours.contains(id) {
+            ours.insert(id)
+            cursor = known[id]?.parentID
+        }
+
+        var seen = Set<String>()
+        cursor = remoteHeadID
+        while let id = cursor, !seen.contains(id) {
+            seen.insert(id)
+            guard let version = known[id] else { return nil }
+            if ours.contains(id) { return version }
+            cursor = version.parentID
+        }
+        return nil
     }
 
     func removeCloudTab(id: UUID) {
@@ -704,7 +900,7 @@ class TabStore: ObservableObject {
                     snapshot[index].cursorPosition = position
                 }
             }
-            let session = SessionData(tabs: snapshot, selectedTabID: selectedTabID)
+            let session = SessionData(tabs: snapshot, selectedTabID: selectedTabID, trashedTabs: trashedTabs)
             let data = try JSONEncoder().encode(session)
             try data.write(to: sessionURL, options: .atomic)
         } catch {
@@ -726,6 +922,7 @@ class TabStore: ObservableObject {
         }
 
         tabs = session.tabs
+        trashedTabs = session.trashedTabs ?? []
         selectedTabID = session.selectedTabID ?? tabs.first?.id
 
         for index in tabs.indices where !tabs[index].languageLocked {
@@ -747,4 +944,12 @@ class TabStore: ObservableObject {
 struct SessionData: Codable {
     let tabs: [TabData]
     let selectedTabID: UUID?
+    /// Optional so sessions written before the trash existed still decode.
+    let trashedTabs: [TabData]?
+
+    init(tabs: [TabData], selectedTabID: UUID?, trashedTabs: [TabData]? = nil) {
+        self.tabs = tabs
+        self.selectedTabID = selectedTabID
+        self.trashedTabs = trashedTabs
+    }
 }
