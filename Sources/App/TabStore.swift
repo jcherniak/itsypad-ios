@@ -515,12 +515,16 @@ class TabStore: ObservableObject {
     }
 
     /// A tab without versions counts as "" so a blank tab never gets an empty
-    /// first version just from being switched away from.
+    /// first version just from being switched away from. Untracked (after a
+    /// relaunch) the persisted head comes before the newest version, which may
+    /// be a synced remote one the live text does not descend from.
     private func latestText(for id: UUID) -> String {
         if let tracking = versionTracking[id], let text = tracking.latestText {
             return text
         }
-        let text = versionStore.latest(for: id)?.text ?? ""
+        let list = versionStore.versions(for: id)
+        let head = tabs.first { $0.id == id }?.headVersionID
+        let text = list.first { $0.id == head }?.text ?? list.first?.text ?? ""
         versionTracking[id, default: VersionTracking()].latestText = text
         return text
     }
@@ -831,7 +835,7 @@ class TabStore: ObservableObject {
         if tabs[localIndex].content == data.content {
             // lastModified is only a hint, but with identical text it is the
             // one ordering we have for a rename or language change
-            if data.lastModified >= tabs[localIndex].lastModified {
+            if data.lastModified > tabs[localIndex].lastModified {
                 applyRemoteMetadata(data, at: localIndex)
             }
             if tabs[localIndex].headVersionID == nil {
@@ -982,6 +986,7 @@ class TabStore: ObservableObject {
 
     private func setLiveText(id: UUID, text: String, headVersionID: String, at index: Int) {
         tabs[index].content = text
+        tabs[index].isDirty = true
         tabs[index].headVersionID = headVersionID
         versionTracking[id, default: VersionTracking()].latestText = text
     }
