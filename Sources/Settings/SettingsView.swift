@@ -22,6 +22,19 @@ struct SettingsView: View {
                     ))
                 }
 
+                Section {
+                    Picker(String(localized: "settings.launch.behavior", defaultValue: "On launch"), selection: $settings.launchBehavior) {
+                        Text(String(localized: "settings.launch.reopen_last", defaultValue: "Reopen last note")).tag(LaunchBehavior.reopenLast)
+                        Text(String(localized: "settings.launch.new_note", defaultValue: "Start new note")).tag(LaunchBehavior.newNote)
+                    }
+
+                    Toggle(String(localized: "settings.launch.auto_paste", defaultValue: "Paste clipboard on open"), isOn: $settings.autoPasteOnOpen)
+                } header: {
+                    Text(String(localized: "settings.launch.title", defaultValue: "Launch"))
+                } footer: {
+                    Text(String(localized: "settings.launch.auto_paste_footer", defaultValue: "Inserts the clipboard into the current note when Itsypad opens. A banner lets you undo it with one tap."))
+                }
+
                 Section(String(localized: "settings.appearance.title", defaultValue: "Appearance")) {
                     Picker(String(localized: "settings.appearance.mode", defaultValue: "Mode"), selection: $settings.appearanceOverride) {
                         Text(String(localized: "settings.appearance.system", defaultValue: "System")).tag("system")

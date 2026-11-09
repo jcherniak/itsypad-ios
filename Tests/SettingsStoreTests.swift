@@ -94,6 +94,47 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(defaults.integer(forKey: "tabWidth"), 2)
     }
 
+    func testDefaultLaunchBehavior() {
+        XCTAssertEqual(store.launchBehavior, .reopenLast)
+    }
+
+    func testDefaultAutoPasteOnOpen() {
+        XCTAssertFalse(store.autoPasteOnOpen)
+    }
+
+    func testLaunchBehaviorPersistsToDefaults() {
+        store.launchBehavior = .newNote
+        XCTAssertEqual(defaults.string(forKey: "launchBehavior"), "newNote")
+    }
+
+    func testAutoPasteOnOpenPersistsToDefaults() {
+        store.autoPasteOnOpen = true
+        XCTAssertTrue(defaults.bool(forKey: "autoPasteOnOpen"))
+    }
+
+    func testLaunchSettingsLoadFromPrePopulatedDefaults() {
+        let name = "com.nickustinov.itsypad.test.\(UUID().uuidString)"
+        let d = UserDefaults(suiteName: name)!
+        d.set("newNote", forKey: "launchBehavior")
+        d.set(true, forKey: "autoPasteOnOpen")
+
+        let loaded = SettingsStore(defaults: d)
+        XCTAssertEqual(loaded.launchBehavior, .newNote)
+        XCTAssertTrue(loaded.autoPasteOnOpen)
+
+        d.removePersistentDomain(forName: name)
+    }
+
+    func testInvalidLaunchBehaviorFallsBackToReopenLast() {
+        let name = "com.nickustinov.itsypad.test.\(UUID().uuidString)"
+        let d = UserDefaults(suiteName: name)!
+        d.set("bogus", forKey: "launchBehavior")
+
+        XCTAssertEqual(SettingsStore(defaults: d).launchBehavior, .reopenLast)
+
+        d.removePersistentDomain(forName: name)
+    }
+
     // MARK: - editorFont computed property
 
     func testEditorFontIsMonospaced() {

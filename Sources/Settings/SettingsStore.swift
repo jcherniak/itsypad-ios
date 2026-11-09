@@ -4,6 +4,11 @@ extension Notification.Name {
     static let settingsChanged = Notification.Name("settingsChanged")
 }
 
+enum LaunchBehavior: String, CaseIterable {
+    case reopenLast
+    case newNote
+}
+
 class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
 
@@ -128,6 +133,22 @@ class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var launchBehavior: LaunchBehavior = .reopenLast {
+        didSet {
+            guard !isLoading else { return }
+            defaults.set(launchBehavior.rawValue, forKey: "launchBehavior")
+            NotificationCenter.default.post(name: .settingsChanged, object: nil)
+        }
+    }
+
+    @Published var autoPasteOnOpen: Bool = false {
+        didSet {
+            guard !isLoading else { return }
+            defaults.set(autoPasteOnOpen, forKey: "autoPasteOnOpen")
+            NotificationCenter.default.post(name: .settingsChanged, object: nil)
+        }
+    }
+
     @Published var icloudSync: Bool = true
 
     func setICloudSync(_ enabled: Bool) {
@@ -174,5 +195,7 @@ class SettingsStore: ObservableObject {
         showLineNumbers = defaults.object(forKey: "showLineNumbers") as? Bool ?? false
         lockRotation = defaults.object(forKey: "lockRotation") as? Bool ?? true
         icloudSync = defaults.object(forKey: "icloudSync") as? Bool ?? true
+        launchBehavior = defaults.string(forKey: "launchBehavior").flatMap(LaunchBehavior.init(rawValue:)) ?? .reopenLast
+        autoPasteOnOpen = defaults.object(forKey: "autoPasteOnOpen") as? Bool ?? false
     }
 }

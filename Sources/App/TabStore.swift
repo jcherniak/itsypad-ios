@@ -76,7 +76,7 @@ class TabStore: ObservableObject {
         tabs.first { $0.id == selectedTabID }
     }
 
-    init(sessionURL: URL? = nil) {
+    init(sessionURL: URL? = nil, launchBehavior: LaunchBehavior? = nil) {
         if let sessionURL {
             self.sessionURL = sessionURL
         } else {
@@ -93,6 +93,13 @@ class TabStore: ObservableObject {
             if isFirstLaunch {
                 addWelcomeTab()
             } else {
+                addNewTab()
+            }
+        } else if (launchBehavior ?? SettingsStore.shared.launchBehavior) == .newNote {
+            let isBlankScratch = selectedTab.map {
+                $0.fileURL == nil && $0.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            } ?? false
+            if !isBlankScratch {
                 addNewTab()
             }
         }
