@@ -285,11 +285,15 @@ struct EditorView: UIViewRepresentable {
                 let selection = textView.selectedRange
                 textView.text = tab.content
                 let length = (tab.content as NSString).length
-                let location = min(selection.location, length)
-                textView.selectedRange = NSRange(
-                    location: location,
-                    length: min(selection.length, length - location)
-                )
+                if let cursor = tabStore.takePendingExternalCursor(for: tabID) {
+                    textView.selectedRange = NSRange(location: min(cursor, length), length: 0)
+                } else {
+                    let location = min(selection.location, length)
+                    textView.selectedRange = NSRange(
+                        location: location,
+                        length: min(selection.length, length - location)
+                    )
+                }
                 coordinator.rehighlight()
                 textView.accessoryBar.refresh()
             }

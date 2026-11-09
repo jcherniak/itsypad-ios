@@ -64,13 +64,37 @@ class TabStore: ObservableObject {
     static let shared = TabStore()
 
     @Published var tabs: [TabData] = []
-    @Published var selectedTabID: UUID?
+    @Published var selectedTabID: UUID? {
+        didSet {
+            if isInitialized, let previous = oldValue, previous != selectedTabID {
+                snapshotIfChanged(id: previous, source: .edit)
+            }
+        }
+    }
     @Published var lastICloudSync: Date?
     @Published var fileSaveError: String?
 
     private var saveDebounceWork: DispatchWorkItem?
     private var languageDetectWork: [UUID: DispatchWorkItem] = [:]
     private let sessionURL: URL
+
+    // Version history – injectable so tests neither sleep nor touch the real store
+    var versionStore: VersionStore = .shared
+    var now: () -> Date = { Date() }
+    var idleInterval: TimeInterval = 3
+    var holdInterval: TimeInterval = 10
+    var deviceName: String = TabVersion.currentDeviceName
+    var versionSyncPolicy: (TabData) -> Bool = { $0.fileURL == nil && SettingsStore.shared.icloudSync }
+
+    private struct VersionTracking {
+        var latestText: String?
+        var idleWork: DispatchWorkItem?
+        var heldSnapshot: TabVersion?
+        var holdWork: DispatchWorkItem?
+    }
+    private var versionTracking: [UUID: VersionTracking] = [:]
+    private var pendingExternalCursor: [UUID: Int] = [:]
+    private var isInitialized = false
 
     var selectedTab: TabData? {
         tabs.first { $0.id == selectedTabID }
@@ -103,6 +127,7 @@ class TabStore: ObservableObject {
                 addNewTab()
             }
         }
+        isInitialized = true
     }
 
     // MARK: - Tab operations
@@ -157,11 +182,16 @@ class TabStore: ObservableObject {
     func closeTab(id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
         let isScratch = tabs[index].fileURL == nil
+        let syncVersions = versionSyncPolicy(tabs[index])
         tabs.remove(at: index)
 
         if isScratch && SettingsStore.shared.icloudSync {
             CloudSyncEngine.shared.recordDeleted(id)
         }
+        cancelVersionTimers(id: id)
+        versionTracking.removeValue(forKey: id)
+        pendingExternalCursor.removeValue(forKey: id)
+        versionStore.deleteAll(tabID: id, syncable: syncVersions)
 
         if selectedTabID == id {
             if tabs.isEmpty {
@@ -175,8 +205,28 @@ class TabStore: ObservableObject {
     }
 
     func updateContent(id: UUID, content: String) {
-        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        guard tabs[index].content != content else { return }
+        guard applyContent(id: id, content: content) else { return }
+        recordEdit(id: id, content: content)
+    }
+
+    /// Content set by something other than typing (version restore, auto-paste
+    /// without a live text view). Does not snapshot: the caller has already
+    /// recorded whatever version it needs. The cursor is picked up once by
+    /// EditorView via takePendingExternalCursor.
+    func setContentExternally(id: UUID, content: String, cursor: Int) {
+        cancelIdleTimer(id: id)
+        pendingExternalCursor[id] = min(max(cursor, 0), content.utf16.count)
+        applyContent(id: id, content: content)
+    }
+
+    func takePendingExternalCursor(for id: UUID) -> Int? {
+        pendingExternalCursor.removeValue(forKey: id)
+    }
+
+    @discardableResult
+    private func applyContent(id: UUID, content: String) -> Bool {
+        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return false }
+        guard tabs[index].content != content else { return false }
 
         var tab = tabs[index]
         tab.content = content
@@ -204,6 +254,168 @@ class TabStore: ObservableObject {
         }
 
         scheduleSave()
+        return true
+    }
+
+    // MARK: - Version history
+
+    /// Single entry point for snapshot decisions. Never writes per keystroke:
+    /// a version is appended after `idleInterval` without edits, or at once
+    /// when the UTF-16 length moved by ≥ 10 % (and ≥ 20 chars) or ≥ 200 chars
+    /// against the latest version. `hold` parks the snapshot in memory until
+    /// commitHeldSnapshot/discardHeldSnapshot, the next real edit, or
+    /// `holdInterval` elapses.
+    func recordEdit(id: UUID, content: String, source: TabVersion.Source = .edit, hold: Bool = false) {
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        if !hold {
+            commitHeldSnapshot(id: id)
+        }
+        let latest = latestText(for: id)
+        guard content != latest else {
+            cancelIdleTimer(id: id)
+            return
+        }
+
+        if hold {
+            cancelIdleTimer(id: id)
+            var tracking = versionTracking[id, default: VersionTracking()]
+            tracking.holdWork?.cancel()
+            tracking.heldSnapshot = makeVersion(id: id, text: content, source: source)
+            let work = DispatchWorkItem { [weak self] in self?.commitHeldSnapshot(id: id) }
+            tracking.holdWork = work
+            versionTracking[id] = tracking
+            DispatchQueue.main.asyncAfter(deadline: .now() + holdInterval, execute: work)
+            return
+        }
+
+        let latestLength = latest.utf16.count
+        let delta = abs(content.utf16.count - latestLength)
+        let bigRelativeChange = latestLength > 0 && delta >= 20 && delta * 10 >= latestLength
+        if delta >= 200 || bigRelativeChange {
+            cancelIdleTimer(id: id)
+            writeVersion(id: id, text: content, source: source)
+            return
+        }
+
+        cancelIdleTimer(id: id)
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.versionTracking[id]?.idleWork = nil
+            self.snapshotIfChanged(id: id, source: source)
+        }
+        versionTracking[id, default: VersionTracking()].idleWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + idleInterval, execute: work)
+    }
+
+    func commitHeldSnapshot(id: UUID) {
+        guard var tracking = versionTracking[id], let held = tracking.heldSnapshot else { return }
+        tracking.holdWork?.cancel()
+        tracking.holdWork = nil
+        tracking.heldSnapshot = nil
+        tracking.latestText = held.text
+        versionTracking[id] = tracking
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        if versionStore.append(held, syncable: versionSyncPolicy(tab)) {
+            versionStore.prune(tabID: id, now: now(), syncable: versionSyncPolicy(tab))
+        }
+    }
+
+    func discardHeldSnapshot(id: UUID) {
+        guard var tracking = versionTracking[id] else { return }
+        tracking.holdWork?.cancel()
+        tracking.holdWork = nil
+        tracking.heldSnapshot = nil
+        tracking.idleWork?.cancel()
+        tracking.idleWork = nil
+        tracking.latestText = tabs.first { $0.id == id }?.content
+        versionTracking[id] = tracking
+    }
+
+    /// Snapshots every tab whose text differs from its latest version and
+    /// commits held snapshots – the undo window closes with the app.
+    func flushPendingVersions() {
+        for tab in tabs {
+            commitHeldSnapshot(id: tab.id)
+            snapshotIfChanged(id: tab.id, source: .edit)
+        }
+    }
+
+    /// Current text becomes a `.restore` version first – history is never
+    /// rewritten – then the chosen text goes live without a second snapshot.
+    func restoreVersion(id: UUID, version: TabVersion) {
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        commitHeldSnapshot(id: id)
+        writeVersion(id: id, text: tab.content, source: .restore)
+        setContentExternally(id: id, content: version.text, cursor: version.text.utf16.count)
+    }
+
+    func setVersionLabel(_ label: String?, versionID: String, tabID: UUID) {
+        guard let tab = tabs.first(where: { $0.id == tabID }) else { return }
+        versionStore.setLabel(label, versionID: versionID, tabID: tabID, syncable: versionSyncPolicy(tab))
+    }
+
+    /// Runs the pending idle snapshot for a tab now (tests only – avoids sleeping).
+    func fireIdleTimer(id: UUID) {
+        guard let work = versionTracking[id]?.idleWork else { return }
+        work.cancel()
+        versionTracking[id]?.idleWork = nil
+        snapshotIfChanged(id: id, source: .edit)
+    }
+
+    /// Runs the pending hold auto-commit for a tab now (tests only).
+    func fireHoldTimer(id: UUID) {
+        guard versionTracking[id]?.holdWork != nil else { return }
+        commitHeldSnapshot(id: id)
+    }
+
+    /// A tab without versions counts as "" so a blank tab never gets an empty
+    /// first version just from being switched away from.
+    private func latestText(for id: UUID) -> String {
+        if let tracking = versionTracking[id], let text = tracking.latestText {
+            return text
+        }
+        let text = versionStore.latest(for: id)?.text ?? ""
+        versionTracking[id, default: VersionTracking()].latestText = text
+        return text
+    }
+
+    private func snapshotIfChanged(id: UUID, source: TabVersion.Source) {
+        cancelIdleTimer(id: id)
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        guard tab.content != latestText(for: id) else { return }
+        writeVersion(id: id, text: tab.content, source: source)
+    }
+
+    private func makeVersion(id: UUID, text: String, source: TabVersion.Source) -> TabVersion {
+        TabVersion(
+            tabID: id,
+            parentID: versionStore.latest(for: id)?.id,
+            createdAt: now(),
+            device: deviceName,
+            text: text,
+            source: source
+        )
+    }
+
+    private func writeVersion(id: UUID, text: String, source: TabVersion.Source) {
+        guard let tab = tabs.first(where: { $0.id == id }) else { return }
+        let version = makeVersion(id: id, text: text, source: source)
+        versionTracking[id, default: VersionTracking()].latestText = text
+        let syncable = versionSyncPolicy(tab)
+        if versionStore.append(version, syncable: syncable) {
+            versionStore.prune(tabID: id, now: now(), syncable: syncable)
+        }
+    }
+
+    private func cancelIdleTimer(id: UUID) {
+        versionTracking[id]?.idleWork?.cancel()
+        versionTracking[id]?.idleWork = nil
+    }
+
+    private func cancelVersionTimers(id: UUID) {
+        cancelIdleTimer(id: id)
+        versionTracking[id]?.holdWork?.cancel()
+        versionTracking[id]?.holdWork = nil
     }
 
     private func scheduleLanguageDetection(id: UUID, content: String, name: String?, fileURL: URL?) {
@@ -406,6 +618,13 @@ class TabStore: ObservableObject {
             if tabs[localIndex].content != data.content
                 || tabs[localIndex].name != data.name
                 || tabs[localIndex].language != data.language {
+                // Snapshot before overwrite: the local text must survive as a
+                // version before remote content replaces it
+                if tabs[localIndex].content != data.content {
+                    commitHeldSnapshot(id: data.id)
+                    cancelIdleTimer(id: data.id)
+                    writeVersion(id: data.id, text: tabs[localIndex].content, source: .conflict)
+                }
                 tabs[localIndex].content = data.content
                 tabs[localIndex].name = data.name
                 tabs[localIndex].language = data.language

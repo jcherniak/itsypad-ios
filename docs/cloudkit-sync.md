@@ -14,8 +14,11 @@ Both the macOS and iOS itsypad apps sync data via CloudKit using `CKSyncEngine` 
 |---|---|---|
 | `ScratchTab` | `name` (String), `content` (String), `language` (String), `languageLocked` (Int64, 0/1), `lastModified` (Date) | recordName = tab UUID |
 | `ClipboardEntry` | `text` (String), `timestamp` (Date) | recordName = entry UUID |
+| `TabVersion` | `tabID` (String, tab UUID), `parentID` (String, optional), `createdAt` (Date), `device` (String), `label` (String, optional), `text` (String), `source` (String: `edit`, `paste`, `conflict`, `manual`, `restore`) | recordName = version id = lowercase hex SHA-256 of `tabID.uuidString + "\n" + text`. No `CKRecord.Reference` – closing a tab deletes its versions explicitly. Immutable, server wins on conflict |
 
-Only scratch tabs (no `fileURL`) are synced. Only text clipboard entries are synced (not images).
+Only scratch tabs (no `fileURL`) are synced, and only their versions. Only text clipboard entries are synced (not images).
+
+`TabVersion` appears in the CloudKit **Development** schema automatically on the first save from a debug build; it must be promoted to **Production** in the CloudKit Console before a release build can sync history.
 
 
 ## Architecture

@@ -4,17 +4,33 @@ import XCTest
 final class TabStoreTests: XCTestCase {
     private var store: TabStore!
     private var tempURL: URL!
+    private var versionsURL: URL!
+    private var hookLog: VersionHookLog!
+    private var clock = Date(timeIntervalSince1970: 1_800_000_000)
 
     override func setUp() {
         super.setUp()
         tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
             .appendingPathExtension("json")
+        versionsURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        hookLog = VersionHookLog()
         store = TabStore(sessionURL: tempURL)
+        configureVersioning(store)
+    }
+
+    private func configureVersioning(_ store: TabStore) {
+        let versionStore = VersionStore(baseURL: versionsURL)
+        versionStore.cloudHooks = hookLog.hooks
+        store.versionStore = versionStore
+        store.now = { [unowned self] in self.clock }
+        store.deviceName = "Test phone"
+        store.versionSyncPolicy = { $0.fileURL == nil }
     }
 
     override func tearDown() {
         try? FileManager.default.removeItem(at: tempURL)
+        try? FileManager.default.removeItem(at: versionsURL)
         store = nil
         super.tearDown()
     }
@@ -609,5 +625,253 @@ final class TabStoreTests: XCTestCase {
         let restored = TabStore(sessionURL: tempURL, launchBehavior: .reopenLast)
         XCTAssertEqual(restored.tabs.count, 1)
         XCTAssertEqual(restored.selectedTabID, existing.id)
+    }
+
+    // MARK: - Version history
+
+    private var versions: [TabVersion] {
+        store.versionStore.versions(for: store.tabs.first!.id)
+    }
+
+    func testRapidEditsProduceOneVersionAfterIdle() {
+        let tabID = store.tabs.first!.id
+        for text in ["a", "ab", "abc", "abcd", "abcde"] {
+            store.updateContent(id: tabID, content: text)
+        }
+        XCTAssertTrue(versions.isEmpty)
+
+        store.fireIdleTimer(id: tabID)
+        XCTAssertEqual(versions.count, 1)
+        XCTAssertEqual(versions.first?.text, "abcde")
+        XCTAssertEqual(versions.first?.source, .edit)
+        XCTAssertEqual(versions.first?.device, "Test phone")
+        XCTAssertEqual(versions.first?.createdAt, clock)
+        XCTAssertNil(versions.first?.parentID)
+        XCTAssertEqual(hookLog.changed, [versions.first!.id])
+
+        // Idle again without edits: nothing new
+        store.fireIdleTimer(id: tabID)
+        XCTAssertEqual(versions.count, 1)
+    }
+
+    func testIdleSnapshotChainsParent() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "first")
+        store.fireIdleTimer(id: tabID)
+        clock.addTimeInterval(30)
+        store.updateContent(id: tabID, content: "first second")
+        store.fireIdleTimer(id: tabID)
+
+        XCTAssertEqual(versions.map(\.text), ["first second", "first"])
+        XCTAssertEqual(versions.first?.parentID, versions.last?.id)
+    }
+
+    func testLargeDeltaSnapshotsImmediately() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "short")
+        store.fireIdleTimer(id: tabID)
+        XCTAssertEqual(versions.count, 1)
+
+        clock.addTimeInterval(1)
+        let pasted = "short\n" + String(repeating: "x", count: 250)
+        store.updateContent(id: tabID, content: pasted)
+        XCTAssertEqual(versions.count, 2)
+        XCTAssertEqual(versions.first?.text, pasted)
+
+        // Relative rule: ≥ 10 % (and ≥ 20 chars) of the latest version
+        clock.addTimeInterval(1)
+        let grown = pasted + String(repeating: "y", count: 40)
+        store.updateContent(id: tabID, content: grown)
+        XCTAssertEqual(versions.count, 3)
+
+        // A single keystroke never snapshots immediately
+        clock.addTimeInterval(1)
+        store.updateContent(id: tabID, content: grown + "z")
+        XCTAssertEqual(versions.count, 3)
+    }
+
+    func testTabSwitchSnapshotsPreviousTab() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "draft before switching")
+        XCTAssertTrue(versions.isEmpty)
+
+        store.addNewTab()
+        XCTAssertEqual(versions.count, 1)
+        XCTAssertEqual(versions.first?.text, "draft before switching")
+
+        // Switching back and forth without edits adds nothing
+        store.selectedTabID = tabID
+        store.selectNeighborTab(delta: 1)
+        XCTAssertEqual(versions.count, 1)
+    }
+
+    func testFlushPendingVersionsSnapshotsEveryChangedTab() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "unsaved")
+        store.flushPendingVersions()
+        XCTAssertEqual(versions.map(\.text), ["unsaved"])
+    }
+
+    func testHoldThenDiscardWritesNothing() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "base")
+        store.fireIdleTimer(id: tabID)
+
+        store.recordEdit(id: tabID, content: "base + pasted", source: .paste, hold: true)
+        store.setContentExternally(id: tabID, content: "base + pasted", cursor: 13)
+        XCTAssertEqual(versions.count, 1)
+
+        store.discardHeldSnapshot(id: tabID)
+        store.fireIdleTimer(id: tabID)
+        store.fireHoldTimer(id: tabID)
+        store.flushPendingVersions()
+        XCTAssertEqual(versions.map(\.text), ["base"])
+        XCTAssertFalse(versions.contains { $0.source == .paste })
+    }
+
+    func testHoldThenCommitWritesOnePasteVersion() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "base")
+        store.fireIdleTimer(id: tabID)
+        let baseID = versions.first!.id
+
+        clock.addTimeInterval(1)
+        store.recordEdit(id: tabID, content: "base + pasted", source: .paste, hold: true)
+        XCTAssertEqual(versions.count, 1)
+
+        store.commitHeldSnapshot(id: tabID)
+        XCTAssertEqual(versions.count, 2)
+        XCTAssertEqual(versions.first?.source, .paste)
+        XCTAssertEqual(versions.first?.text, "base + pasted")
+        XCTAssertEqual(versions.first?.parentID, baseID)
+
+        store.commitHeldSnapshot(id: tabID)
+        store.fireHoldTimer(id: tabID)
+        XCTAssertEqual(versions.count, 2)
+    }
+
+    func testHoldIsCommittedByNextRealEdit() {
+        let tabID = store.tabs.first!.id
+        store.recordEdit(id: tabID, content: "pasted", source: .paste, hold: true)
+        XCTAssertTrue(versions.isEmpty)
+
+        store.updateContent(id: tabID, content: "pasted plus typing")
+        XCTAssertEqual(versions.map(\.source), [.paste])
+        XCTAssertEqual(versions.first?.text, "pasted")
+    }
+
+    func testHoldTimerAutoCommits() {
+        let tabID = store.tabs.first!.id
+        store.recordEdit(id: tabID, content: "pasted", source: .paste, hold: true)
+        store.fireHoldTimer(id: tabID)
+        XCTAssertEqual(versions.map(\.source), [.paste])
+    }
+
+    func testApplyCloudTabSnapshotsLocalTextAsConflictBeforeOverwrite() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "local text")
+
+        let record = CloudTabRecord(
+            id: tabID,
+            name: "Remote",
+            content: "remote text",
+            language: "plain",
+            languageLocked: false,
+            lastModified: Date().addingTimeInterval(100)
+        )
+        store.applyCloudTab(record)
+
+        XCTAssertEqual(store.tabs.first?.content, "remote text")
+        XCTAssertEqual(versions.count, 1)
+        XCTAssertEqual(versions.first?.source, .conflict)
+        XCTAssertEqual(versions.first?.text, "local text")
+        XCTAssertNil(versions.first?.label)
+
+        // The pending idle timer must not resurrect the overwritten text
+        store.fireIdleTimer(id: tabID)
+        XCTAssertEqual(versions.count, 1)
+    }
+
+    func testApplyCloudTabIgnoredWhenOlderWritesNoVersion() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "local text")
+        let record = CloudTabRecord(
+            id: tabID, name: "Old", content: "old", language: "plain", languageLocked: false, lastModified: .distantPast
+        )
+        store.applyCloudTab(record)
+        XCTAssertTrue(versions.isEmpty)
+    }
+
+    func testRestoreVersionAppendsRestoreAndSetsPendingCursor() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "version one")
+        store.fireIdleTimer(id: tabID)
+        let target = versions.first!
+        clock.addTimeInterval(60)
+        store.updateContent(id: tabID, content: "version two – unsaved")
+
+        store.restoreVersion(id: tabID, version: target)
+
+        XCTAssertEqual(store.tabs.first?.content, "version one")
+        XCTAssertEqual(versions.map(\.text), ["version two – unsaved", "version one"])
+        XCTAssertEqual(versions.first?.source, .restore)
+        XCTAssertEqual(versions.first?.parentID, target.id)
+        XCTAssertEqual(store.takePendingExternalCursor(for: tabID), "version one".utf16.count)
+        XCTAssertNil(store.takePendingExternalCursor(for: tabID))
+
+        // The restored text already exists as a version – no new snapshot
+        store.fireIdleTimer(id: tabID)
+        store.flushPendingVersions()
+        XCTAssertEqual(versions.count, 2)
+    }
+
+    func testSetContentExternallyClampsCursorAndDoesNotSnapshot() {
+        let tabID = store.tabs.first!.id
+        store.setContentExternally(id: tabID, content: "abc", cursor: 99)
+        XCTAssertEqual(store.tabs.first?.content, "abc")
+        XCTAssertEqual(store.tabs.first?.name, "abc")
+        XCTAssertEqual(store.takePendingExternalCursor(for: tabID), 3)
+        store.fireIdleTimer(id: tabID)
+        XCTAssertTrue(versions.isEmpty)
+    }
+
+    func testCloseTabDeletesVersionsAndQueuesCloudDeletes() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "one")
+        store.fireIdleTimer(id: tabID)
+        clock.addTimeInterval(1)
+        store.updateContent(id: tabID, content: "one two")
+        store.fireIdleTimer(id: tabID)
+        let ids = Set(store.versionStore.versions(for: tabID).map(\.id))
+        XCTAssertEqual(ids.count, 2)
+
+        store.closeTab(id: tabID)
+        XCTAssertTrue(store.versionStore.versions(for: tabID).isEmpty)
+        XCTAssertEqual(Set(hookLog.deleted), ids)
+    }
+
+    func testCloseFileBackedTabDeletesVersionsLocallyOnly() {
+        let tabID = store.tabs.first!.id
+        store.tabs[0].fileURL = URL(fileURLWithPath: "/tmp/notes.txt")
+        store.updateContent(id: tabID, content: "file text")
+        store.fireIdleTimer(id: tabID)
+        XCTAssertEqual(store.versionStore.versions(for: tabID).count, 1)
+        XCTAssertTrue(hookLog.changed.isEmpty)
+
+        store.closeTab(id: tabID)
+        XCTAssertTrue(store.versionStore.versions(for: tabID).isEmpty)
+        XCTAssertTrue(hookLog.deleted.isEmpty)
+    }
+
+    func testSetVersionLabelGoesThroughStore() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "named")
+        store.fireIdleTimer(id: tabID)
+        let id = versions.first!.id
+        hookLog.changed.removeAll()
+
+        store.setVersionLabel("Milestone", versionID: id, tabID: tabID)
+        XCTAssertEqual(versions.first?.label, "Milestone")
+        XCTAssertEqual(hookLog.changed, [id])
     }
 }
