@@ -51,6 +51,22 @@ final class CloudSyncEngineTests: XCTestCase {
         XCTAssertNil(CloudSyncEngine.tabRecord(from: scratchTabRecord(id: id, content: "text", head: nil))?.headVersionID)
     }
 
+    func testScratchTabRecordRoundTripKeepsFastForwardFromID() {
+        let id = UUID()
+        let tab = TabData(id: id, name: "Mine", content: "ours", headVersionID: "head", pendingFastForwardID: "parked")
+        let record = scratchTabRecord(id: id, content: "", head: nil)
+        CloudSyncEngine.fill(record, from: tab)
+        XCTAssertEqual(record["fastForwardFromID"] as? String, "parked")
+
+        let parsed = CloudSyncEngine.tabRecord(from: record)
+        XCTAssertEqual(parsed?.content, "ours")
+        XCTAssertEqual(parsed?.headVersionID, "head")
+        XCTAssertEqual(parsed?.fastForwardFromID, "parked")
+
+        CloudSyncEngine.fill(record, from: TabData(id: id, name: "Mine", content: "ours", headVersionID: "head"))
+        XCTAssertNil(CloudSyncEngine.tabRecord(from: record)?.fastForwardFromID)
+    }
+
     func testTabRecordParsesTombstone() {
         let record = scratchTabRecord(id: UUID(), content: "text", head: nil)
         let when = Date(timeIntervalSince1970: 1_800_000_000)

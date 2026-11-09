@@ -807,7 +807,8 @@ final class TabStoreTests: XCTestCase {
         head: String?,
         name: String = "Remote",
         language: String = "plain",
-        locked: Bool = false
+        locked: Bool = false,
+        fastForward: String? = nil
     ) -> CloudTabRecord {
         CloudTabRecord(
             id: store.tabs.first!.id,
@@ -816,7 +817,8 @@ final class TabStoreTests: XCTestCase {
             language: language,
             languageLocked: locked,
             lastModified: Date().addingTimeInterval(100),
-            headVersionID: head
+            headVersionID: head,
+            fastForwardFromID: fastForward
         )
     }
 
@@ -936,8 +938,9 @@ final class TabStoreTests: XCTestCase {
         XCTAssertEqual(versions[0].parentID, baseID)
         XCTAssertEqual(versions[1].source, .conflict)
         XCTAssertNil(versions[1].label)
-        // Head = the remote copy, so the other device fast-forwards to our text
-        XCTAssertEqual(store.tabs.first?.headVersionID, versions[0].id)
+        // Head stays our text; the parked copy is offered as the fast-forward hint
+        XCTAssertEqual(store.tabs.first?.headVersionID, versions[1].id)
+        XCTAssertEqual(store.tabs.first?.pendingFastForwardID, versions[0].id)
     }
 
     func testApplyCloudTabFreshBlankTabAdoptsRemoteText() {
@@ -1056,6 +1059,7 @@ final class TabStoreTests: XCTestCase {
         XCTAssertNil(session.trashedTabs)
         let tab = session.tabs[0]
         XCTAssertNil(tab.headVersionID)
+        XCTAssertNil(tab.pendingFastForwardID)
         XCTAssertNil(tab.deletedAt)
         XCTAssertNil(tab.deletedOn)
         XCTAssertFalse(tab.hasConflict)
@@ -1076,10 +1080,88 @@ final class TabStoreTests: XCTestCase {
 
         let restored = TabStore(sessionURL: tempURL)
         XCTAssertEqual(restored.tabs.first?.headVersionID, store.tabs.first?.headVersionID)
+        XCTAssertNotNil(store.tabs.first?.pendingFastForwardID)
+        XCTAssertEqual(restored.tabs.first?.pendingFastForwardID, store.tabs.first?.pendingFastForwardID)
         XCTAssertTrue(restored.tabs.first!.hasConflict)
         XCTAssertEqual(restored.trashedTabs.map(\.name), ["Binned"])
         XCTAssertEqual(restored.trashedTabs.first?.deletedAt, clock)
         XCTAssertEqual(restored.trashedTabs.first?.deletedOn, "Test phone")
+    }
+
+    func testAcknowledgingRecordClearsFastForwardMarker() {
+        let tabID = store.tabs.first!.id
+        let baseID = snapshot("a\nb")
+        let localID = TabVersion.makeID(tabID: tabID, text: "a\nX")
+        store.updateContent(id: tabID, content: "a\nX")
+        store.applyCloudTab(remote("a\nY", head: baseID))
+        let parked = TabVersion.makeID(tabID: tabID, text: "a\nY")
+        XCTAssertEqual(store.tabs.first?.pendingFastForwardID, parked)
+        XCTAssertEqual(store.tabs.first?.headVersionID, localID)
+
+        // The same record again: not an acknowledgement, the hint stays
+        cloudLog.changed.removeAll()
+        store.applyCloudTab(remote("a\nY", head: parked))
+        XCTAssertEqual(store.tabs.first?.pendingFastForwardID, parked)
+        XCTAssertEqual(store.tabs.first?.content, "a\nX")
+
+        // The other device adopted our text
+        cloudLog.changed.removeAll()
+        store.applyCloudTab(remote("a\nX", head: localID))
+        XCTAssertNil(store.tabs.first?.pendingFastForwardID)
+        XCTAssertEqual(store.tabs.first?.headVersionID, localID)
+        XCTAssertEqual(cloudLog.changed, [tabID])
+
+        // Nothing to clear: no further push
+        store.applyCloudTab(remote("a\nX", head: localID))
+        XCTAssertEqual(cloudLog.changed, [tabID])
+    }
+
+    func testRecordWhoseHeadMovedOnClearsFastForwardMarker() {
+        let tabID = store.tabs.first!.id
+        let a: TabStore = store
+        let b = makePeer(device: "Other phone")
+
+        _ = edit(a, tabID, "a\nb\nc")
+        syncVersions(tabID, from: a, to: b)
+        push(tabID, from: a, to: b)
+        let a1 = edit(a, tabID, "a\nX\nc")
+        let b1 = edit(b, tabID, "a\nY\nc")
+        syncVersions(tabID, from: b, to: a)
+        push(tabID, from: b, to: a)
+        XCTAssertEqual(a.tabs.first?.pendingFastForwardID, b1)
+
+        // B adopts A's text, then edits again: its head is a child of A's text
+        push(tabID, from: a, to: b)
+        XCTAssertEqual(tab(b, tabID).content, "a\nX\nc")
+        let b2 = edit(b, tabID, "a\nX\nc\nd")
+        XCTAssertEqual(b.versionStore.version(withID: b2)?.parentID, a1)
+        XCTAssertNil(tab(b, tabID).pendingFastForwardID)
+
+        syncVersions(tabID, from: b, to: a)
+        push(tabID, from: b, to: a)
+        XCTAssertNil(a.tabs.first?.pendingFastForwardID)
+        XCTAssertEqual(a.tabs.first?.content, "a\nX\nc\nd")
+        XCTAssertEqual(a.tabs.first?.headVersionID, b2)
+    }
+
+    func testFastForwardMarkerSurvivesRelaunchAndRestoreClearsIt() {
+        let tabID = store.tabs.first!.id
+        let baseID = snapshot("a\nb")
+        store.updateContent(id: tabID, content: "a\nX")
+        store.applyCloudTab(remote("a\nY", head: baseID))
+        let parked = TabVersion.makeID(tabID: tabID, text: "a\nY")
+        XCTAssertEqual(store.tabs.first?.pendingFastForwardID, parked)
+        store.saveSession()
+
+        let restored = TabStore(sessionURL: tempURL)
+        configureVersioning(restored)
+        XCTAssertEqual(restored.tabs.first?.pendingFastForwardID, parked)
+
+        cloudLog.changed.removeAll()
+        restored.restoreVersion(id: tabID, version: restored.versionStore.version(withID: baseID)!)
+        XCTAssertNil(restored.tabs.first?.pendingFastForwardID)
+        XCTAssertEqual(restored.tabs.first?.headVersionID, baseID)
+        XCTAssertTrue(cloudLog.changed.contains(tabID))
     }
 
     func testRestoreVersionAppendsRestoreAndSetsPendingCursor() {
@@ -1441,7 +1523,8 @@ final class TabStoreTests: XCTestCase {
         let tab = self.tab(source, id)
         target.applyCloudTab(CloudTabRecord(
             id: id, name: tab.name, content: tab.content, language: tab.language,
-            languageLocked: tab.languageLocked, lastModified: tab.lastModified, headVersionID: tab.headVersionID
+            languageLocked: tab.languageLocked, lastModified: tab.lastModified, headVersionID: tab.headVersionID,
+            fastForwardFromID: tab.pendingFastForwardID
         ))
     }
 
@@ -1479,10 +1562,11 @@ final class TabStoreTests: XCTestCase {
         push(tabID, from: b, to: a)
         XCTAssertEqual(a.tabs.first?.content, "a\nX\nc")
         XCTAssertTrue(a.tabs.first!.hasConflict)
-        XCTAssertEqual(a.tabs.first?.headVersionID, b1)
+        XCTAssertEqual(a.tabs.first?.headVersionID, a1)
+        XCTAssertEqual(a.tabs.first?.pendingFastForwardID, b1)
         XCTAssertEqual(a.versionStore.version(withID: b1)?.label?.hasPrefix("Conflict – Other phone "), true)
 
-        // A's re-push: its head is B's text, so B fast-forwards to A's text
+        // A's re-push: its hint names B's text, so B fast-forwards to A's text
         push(tabID, from: a, to: b)
         XCTAssertEqual(tab(b, tabID).content, "a\nX\nc")
         XCTAssertFalse(tab(b, tabID).hasConflict)
@@ -1502,5 +1586,81 @@ final class TabStoreTests: XCTestCase {
         push(tabID, from: b, to: a)
         XCTAssertEqual(a.tabs.first?.content, "a\nX and more\nc")
         XCTAssertEqual(a.tabs.first?.headVersionID, a2)
+        XCTAssertNil(a.tabs.first?.pendingFastForwardID)
+    }
+
+    /// A snapshots again before its kept-local push reaches B: the head has
+    /// moved on, but the hint still names B's text, so B fast-forwards.
+    func testFastForwardHintSurvivesLaterSnapshotsOnTheSender() {
+        let tabID = store.tabs.first!.id
+        let a: TabStore = store
+        let b = makePeer(device: "Other phone")
+
+        _ = edit(a, tabID, "a\nb\nc")
+        syncVersions(tabID, from: a, to: b)
+        push(tabID, from: a, to: b)
+
+        _ = edit(a, tabID, "a\nX\nc")
+        let b1 = edit(b, tabID, "a\nY\nc")
+        syncVersions(tabID, from: b, to: a)
+        push(tabID, from: b, to: a)
+        XCTAssertEqual(a.tabs.first?.content, "a\nX\nc")
+        XCTAssertEqual(a.tabs.first?.pendingFastForwardID, b1)
+
+        let a2 = edit(a, tabID, "a\nX2\nc")
+        XCTAssertEqual(a.tabs.first?.headVersionID, a2)
+        XCTAssertEqual(a.tabs.first?.pendingFastForwardID, b1)
+
+        syncVersions(tabID, from: a, to: b)
+        push(tabID, from: a, to: b)
+        XCTAssertEqual(tab(b, tabID).content, "a\nX2\nc")
+        XCTAssertEqual(a.tabs.first?.content, "a\nX2\nc")
+        XCTAssertFalse(tab(b, tabID).hasConflict)
+        XCTAssertEqual(tab(b, tabID).headVersionID, a2)
+        let bTexts = b.versionStore.versions(for: tabID).map(\.text)
+        XCTAssertTrue(bTexts.contains("a\nY\nc"))
+        XCTAssertTrue(bTexts.contains("a\nX2\nc"))
+        // B parked nothing itself; the only label is A's, synced onto B's own text
+        XCTAssertEqual(b.versionStore.versions(for: tabID).filter { $0.label != nil }.map(\.id), [b1])
+    }
+
+    /// B edits again before A's hinted record arrives: no fast-forward, same
+    /// line conflict, B keeps its text and hints back, and A adopts B's text.
+    func testReceiverThatEditedAgainKeepsItsTextAndHintsBack() {
+        let tabID = store.tabs.first!.id
+        let a: TabStore = store
+        let b = makePeer(device: "Other phone")
+
+        _ = edit(a, tabID, "a\nb\nc")
+        syncVersions(tabID, from: a, to: b)
+        push(tabID, from: a, to: b)
+
+        _ = edit(a, tabID, "a\nX\nc")
+        let b1 = edit(b, tabID, "a\nY\nc")
+        syncVersions(tabID, from: b, to: a)
+        push(tabID, from: b, to: a)
+        XCTAssertEqual(a.tabs.first?.pendingFastForwardID, b1)
+        let a2 = edit(a, tabID, "a\nX2\nc")
+        let b2 = edit(b, tabID, "a\nY2\nc")
+
+        syncVersions(tabID, from: a, to: b)
+        push(tabID, from: a, to: b)
+        XCTAssertEqual(tab(b, tabID).content, "a\nY2\nc")
+        XCTAssertTrue(tab(b, tabID).hasConflict)
+        XCTAssertEqual(tab(b, tabID).headVersionID, b2)
+        XCTAssertEqual(tab(b, tabID).pendingFastForwardID, a2)
+        XCTAssertEqual(b.versionStore.version(withID: a2)?.label?.hasPrefix("Conflict – Test phone "), true)
+
+        syncVersions(tabID, from: b, to: a)
+        push(tabID, from: b, to: a)
+        XCTAssertEqual(a.tabs.first?.content, "a\nY2\nc")
+        XCTAssertEqual(tab(b, tabID).content, "a\nY2\nc")
+        XCTAssertEqual(a.tabs.first?.headVersionID, b2)
+        XCTAssertNil(a.tabs.first?.pendingFastForwardID)
+        // Adopting B's text raised no new conflict copy on A: the only labelled
+        // versions are B's parked text from round one and A's text B parked
+        let labelled = Set(a.versionStore.versions(for: tabID).filter { $0.label != nil }.map(\.id))
+        XCTAssertTrue(labelled.isSubset(of: [b1, a2]))
+        XCTAssertEqual(Set(b.versionStore.versions(for: tabID).filter { $0.label != nil }.map(\.id)), [a2, b1])
     }
 }
