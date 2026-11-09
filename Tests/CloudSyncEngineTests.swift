@@ -1,3 +1,4 @@
+import CloudKit
 import XCTest
 @testable import ItsypadCore
 
@@ -22,6 +23,142 @@ final class CloudSyncEngineTests: XCTestCase {
         XCTAssertEqual(record.language, "swift")
         XCTAssertTrue(record.languageLocked)
         XCTAssertEqual(record.lastModified, date)
+        XCTAssertNil(record.headVersionID)
+    }
+
+    // MARK: - ScratchTab record parsing
+
+    private func scratchTabRecord(id: UUID, content: String, head: String?, name: String = "Remote") -> CKRecord {
+        let recordID = CKRecord.ID(recordName: id.uuidString, zoneID: CKRecordZone.ID(zoneName: "ItsypadData"))
+        let record = CKRecord(recordType: CloudSyncEngine.RecordType.scratchTab.rawValue, recordID: recordID)
+        record["name"] = name as CKRecordValue
+        record["content"] = content as CKRecordValue
+        record["language"] = "plain" as CKRecordValue
+        record["languageLocked"] = 0 as CKRecordValue
+        record["lastModified"] = Date() as CKRecordValue
+        record["headVersionID"] = head.map { $0 as CKRecordValue }
+        return record
+    }
+
+    func testTabRecordParsesHeadVersionID() {
+        let id = UUID()
+        let parsed = CloudSyncEngine.tabRecord(from: scratchTabRecord(id: id, content: "text", head: "abc"))
+        XCTAssertEqual(parsed?.id, id)
+        XCTAssertEqual(parsed?.content, "text")
+        XCTAssertEqual(parsed?.headVersionID, "abc")
+        XCTAssertNil(CloudSyncEngine.tabRecord(from: scratchTabRecord(id: id, content: "text", head: nil))?.headVersionID)
+    }
+
+    // MARK: - resolveTabConflict
+
+    private func makeStore() -> (TabStore, URL) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let store = TabStore(sessionURL: dir.appendingPathComponent("session.json"))
+        let versionStore = VersionStore(baseURL: dir)
+        versionStore.cloudHooks = VersionStore.CloudHooks(versionChanged: { _ in }, versionDeleted: { _ in })
+        store.versionStore = versionStore
+        store.versionSyncPolicy = { _ in false }
+        store.historySettings = { (true, 200, 90) }
+        return (store, dir)
+    }
+
+    func testResolveTabConflictMergesServerTextAndRePushesWhenItDiffers() {
+        let (store, dir) = makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let engine = CloudSyncEngine(directoryURL: dir)
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "a\nb\nc\nd")
+        store.fireIdleTimer(id: tabID)
+        let baseID = store.versionStore.latest(for: tabID)!.id
+        store.updateContent(id: tabID, content: "A\nb\nc\nd")
+
+        let local = scratchTabRecord(id: tabID, content: "A\nb\nc\nd", head: baseID)
+        let server = scratchTabRecord(id: tabID, content: "a\nb\nc\nD", head: baseID)
+
+        XCTAssertTrue(engine.resolveTabConflict(local: local, server: server, tabStore: store))
+        XCTAssertEqual(store.tabs.first?.content, "A\nb\nc\nD")
+        XCTAssertEqual(store.tabs.first?.name, "Remote")
+        XCTAssertFalse(store.tabs.first!.hasConflict)
+
+        // Server already has exactly our merged text: nothing to push back
+        let settled = scratchTabRecord(id: tabID, content: "A\nb\nc\nD", head: store.tabs.first?.headVersionID)
+        XCTAssertFalse(engine.resolveTabConflict(local: local, server: settled, tabStore: store))
+        XCTAssertEqual(store.tabs.first?.content, "A\nb\nc\nD")
+    }
+
+    func testResolveTabConflictFindsBaseThroughSyncedRemoteVersion() {
+        let (store, dir) = makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let engine = CloudSyncEngine(directoryURL: dir)
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "a\nb\nc")
+        store.fireIdleTimer(id: tabID)
+        let baseID = store.versionStore.latest(for: tabID)!.id
+
+        // The server descends from our base and edited the last line
+        let theirs = TabVersion(tabID: tabID, parentID: baseID, device: "Mac", text: "a\nb\nC", source: .edit)
+        store.versionStore.applyCloud(theirs)
+        // We edited the first line meanwhile
+        store.updateContent(id: tabID, content: "A\nb\nc")
+        store.fireIdleTimer(id: tabID)
+
+        let server = scratchTabRecord(id: tabID, content: theirs.text, head: theirs.id)
+        let local = CKRecord(recordType: "ScratchTab", recordID: server.recordID)
+        XCTAssertTrue(engine.resolveTabConflict(local: local, server: server, tabStore: store))
+        XCTAssertEqual(store.tabs.first?.content, "A\nb\nC")
+        XCTAssertFalse(store.tabs.first!.hasConflict)
+    }
+
+    func testResolveTabConflictKeepsLocalWhenServerHasNoHead() {
+        let (store, dir) = makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let engine = CloudSyncEngine(directoryURL: dir)
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "ours")
+        store.fireIdleTimer(id: tabID)
+
+        let server = scratchTabRecord(id: tabID, content: "theirs", head: nil)
+        let local = CKRecord(recordType: "ScratchTab", recordID: server.recordID)
+        XCTAssertTrue(engine.resolveTabConflict(local: local, server: server, tabStore: store))
+        XCTAssertEqual(store.tabs.first?.content, "ours")
+        XCTAssertTrue(store.tabs.first!.hasConflict)
+        XCTAssertTrue(store.versionStore.versions(for: tabID).contains { $0.text == "theirs" && $0.source == .conflict })
+    }
+
+    func testResolveTabConflictDoesNotRePushWhenServerTextWins() {
+        let (store, dir) = makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let engine = CloudSyncEngine(directoryURL: dir)
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "base")
+        store.fireIdleTimer(id: tabID)
+        let localID = store.versionStore.latest(for: tabID)!.id
+
+        let local = scratchTabRecord(id: tabID, content: "base", head: localID)
+        let server = scratchTabRecord(id: tabID, content: "base and more", head: localID)
+
+        XCTAssertFalse(engine.resolveTabConflict(local: local, server: server, tabStore: store))
+        XCTAssertEqual(store.tabs.first?.content, "base and more")
+    }
+
+    func testResolveTabConflictKeepsLocalAndRePushesOnOverlap() {
+        let (store, dir) = makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let engine = CloudSyncEngine(directoryURL: dir)
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "a\nb")
+        store.fireIdleTimer(id: tabID)
+        let baseID = store.versionStore.latest(for: tabID)!.id
+        store.updateContent(id: tabID, content: "a\nX")
+
+        let local = scratchTabRecord(id: tabID, content: "a\nX", head: baseID)
+        let server = scratchTabRecord(id: tabID, content: "a\nY", head: baseID)
+
+        XCTAssertTrue(engine.resolveTabConflict(local: local, server: server, tabStore: store))
+        XCTAssertEqual(store.tabs.first?.content, "a\nX")
+        XCTAssertTrue(store.tabs.first!.hasConflict)
+        XCTAssertTrue(store.versionStore.versions(for: tabID).contains { $0.text == "a\nY" && $0.source == .conflict })
     }
 
     func testCloudTabRecordMutability() {

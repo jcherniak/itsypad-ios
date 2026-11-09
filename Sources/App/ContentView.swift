@@ -270,6 +270,13 @@ struct ContentView: View {
                         .frame(width: 6, height: 6)
                 }
 
+                if tab.hasConflict {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel(String(localized: "tab.conflict_badge", defaultValue: "Sync conflict"))
+                }
+
                 Spacer(minLength: 0)
             }
 

@@ -75,4 +75,69 @@ final class LineDiffTests: XCTestCase {
         XCTAssertEqual(result.filter { $0.kind == .added }.count, 2)
         XCTAssertTrue(result.allSatisfy { $0.kind != .same })
     }
+
+    // MARK: - merge3
+
+    private let base = "one\ntwo\nthree\nfour\nfive\nsix"
+
+    func testMerge3AppliesEditsInDifferentRegions() {
+        let ours = "ONE\ntwo\nthree\nfour\nfive\nsix"
+        let theirs = "one\ntwo\nthree\nfour\nfive\nSIX"
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: ours, theirs: theirs), .clean("ONE\ntwo\nthree\nfour\nfive\nSIX"))
+    }
+
+    func testMerge3CombinesInsertionAndDeletion() {
+        let ours = "one\ntwo\nthree\nfour\nfive\nsix\nseven"
+        let theirs = "one\nthree\nfour\nfive\nsix"
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: ours, theirs: theirs), .clean("one\nthree\nfour\nfive\nsix\nseven"))
+    }
+
+    func testMerge3SameLinesConflict() {
+        let ours = "one\ntwo\nTHREE\nfour\nfive\nsix"
+        let theirs = "one\ntwo\n3\nfour\nfive\nsix"
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: ours, theirs: theirs), .conflicted)
+    }
+
+    func testMerge3AdjacentEditsConflict() {
+        let ours = "one\nTWO\nthree\nfour\nfive\nsix"
+        let theirs = "one\ntwo\nTHREE\nfour\nfive\nsix"
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: ours, theirs: theirs), .conflicted)
+    }
+
+    func testMerge3InsertionsAtSamePointConflict() {
+        let ours = "one\ntwo\nours\nthree\nfour\nfive\nsix"
+        let theirs = "one\ntwo\ntheirs\nthree\nfour\nfive\nsix"
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: ours, theirs: theirs), .conflicted)
+    }
+
+    func testMerge3IdenticalSidesAreClean() {
+        let both = "one\nTWO\nthree"
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: both, theirs: both), .clean(both))
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: base, theirs: base), .clean(base))
+    }
+
+    func testMerge3OneSideUnchangedTakesTheOther() {
+        let edited = "one\ntwo\nthree\nfour\nfive\nsix\nseven"
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: base, theirs: edited), .clean(edited))
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: edited, theirs: base), .clean(edited))
+        XCTAssertEqual(LineDiff.merge3(base: "", ours: "", theirs: "new"), .clean("new"))
+    }
+
+    func testMerge3SameChangeOnBothSidesPlusOneMore() {
+        // Theirs already contains our change (it merged our push) and adds one
+        let ours = "ONE\ntwo\nthree\nfour\nfive\nsix"
+        let theirs = "ONE\ntwo\nthree\nfour\nfive\nSIX"
+        XCTAssertEqual(LineDiff.merge3(base: base, ours: ours, theirs: theirs), .clean(theirs))
+    }
+
+    func testMerge3KeepsTrailingNewlineOfTheSideThatChangedIt() {
+        XCTAssertEqual(LineDiff.merge3(base: "a\nb", ours: "A\nb", theirs: "a\nb\n"), .clean("A\nb\n"))
+        XCTAssertEqual(LineDiff.merge3(base: "a\nb\n", ours: "a\nb", theirs: "a\nB\n"), .clean("a\nB"))
+        XCTAssertEqual(LineDiff.merge3(base: "a\nb\nc\n", ours: "A\nb\nc\n", theirs: "a\nb\nC\n"), .clean("A\nb\nC\n"))
+    }
+
+    func testMerge3OversizedInputIsConflicted() {
+        let big = (0...LineDiff.maxLines).map(String.init).joined(separator: "\n")
+        XCTAssertEqual(LineDiff.merge3(base: big, ours: big + "\nx", theirs: "y\n" + big), .conflicted)
+    }
 }
