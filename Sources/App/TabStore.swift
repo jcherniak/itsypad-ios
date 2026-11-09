@@ -82,6 +82,16 @@ extension TabData: Codable {
 class TabStore: ObservableObject {
     static let shared = TabStore()
 
+    struct CloudHooks {
+        var recordChanged: (UUID) -> Void
+        var recordDeleted: (UUID) -> Void
+
+        static let cloudKit = CloudHooks(
+            recordChanged: { CloudSyncEngine.shared.recordChanged($0) },
+            recordDeleted: { CloudSyncEngine.shared.recordDeleted($0) }
+        )
+    }
+
     @Published var tabs: [TabData] = []
     /// Tabs in the trash – never shown as live tabs, persisted with the session.
     @Published var trashedTabs: [TabData] = []
@@ -101,6 +111,7 @@ class TabStore: ObservableObject {
 
     // Version history – injectable so tests neither sleep nor touch the real store
     var versionStore: VersionStore = .shared
+    var cloudHooks: CloudHooks = .cloudKit
     var now: () -> Date = { Date() }
     var idleInterval: TimeInterval = 3
     var holdInterval: TimeInterval = 10
@@ -162,7 +173,7 @@ class TabStore: ObservableObject {
         tabs.append(tab)
         selectedTabID = tab.id
         scheduleSave()
-        CloudSyncEngine.shared.recordChanged(tab.id)
+        cloudHooks.recordChanged(tab.id)
     }
 
     static var welcomeContent: String {
@@ -204,29 +215,124 @@ class TabStore: ObservableObject {
         selectedTabID = tabs[newIndex].id
     }
 
+    /// A scratch tab goes to the trash with its history intact; the tombstone
+    /// travels on its ScratchTab record. A file-backed tab is simply closed –
+    /// the file is its own backup.
     func closeTab(id: UUID) {
         guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        let isScratch = tabs[index].fileURL == nil
-        let syncVersions = versionSyncPolicy(tabs[index])
-        tabs.remove(at: index)
+        var tab = tabs[index]
 
-        if isScratch && SettingsStore.shared.icloudSync {
-            CloudSyncEngine.shared.recordDeleted(id)
+        if tab.fileURL == nil {
+            commitHeldSnapshot(id: id)
+            snapshotIfChanged(id: id, source: .edit)
+            tab = tabs[index]
+            tab.deletedAt = now()
+            tab.deletedOn = deviceName
+            trashedTabs.append(tab)
+            tabs.remove(at: index)
+            forgetTracking(id: id)
+            cloudHooks.recordChanged(id)
+        } else {
+            tabs.remove(at: index)
+            forgetTracking(id: id)
+            versionStore.deleteAll(tabID: id, syncable: versionSyncPolicy(tab))
         }
+
+        reselectAfterRemoval(of: id, at: index)
+        scheduleSave()
+    }
+
+    // MARK: - Trash
+
+    func restoreFromTrash(id: UUID) {
+        guard let index = trashedTabs.firstIndex(where: { $0.id == id }) else { return }
+        var tab = trashedTabs.remove(at: index)
+        tab.deletedAt = nil
+        tab.deletedOn = nil
+        tabs.append(tab)
+        selectedTabID = tab.id
+        if tab.fileURL == nil {
+            cloudHooks.recordChanged(id)
+        }
+        scheduleSave()
+    }
+
+    /// Removes the tab and every version of it, here and on every device.
+    func deletePermanently(id: UUID) {
+        let tab: TabData
+        var liveIndex: Int?
+        if let index = trashedTabs.firstIndex(where: { $0.id == id }) {
+            tab = trashedTabs.remove(at: index)
+        } else if let index = tabs.firstIndex(where: { $0.id == id }) {
+            tab = tabs.remove(at: index)
+            liveIndex = index
+        } else {
+            return
+        }
+        forgetTracking(id: id)
+        versionStore.deleteAll(tabID: id, syncable: versionSyncPolicy(tab))
+        if tab.fileURL == nil {
+            cloudHooks.recordDeleted(id)
+        }
+        if let liveIndex {
+            reselectAfterRemoval(of: id, at: liveIndex)
+        }
+        scheduleSave()
+    }
+
+    func emptyTrash() {
+        for tab in trashedTabs {
+            deletePermanently(id: tab.id)
+        }
+    }
+
+    /// Hard-deletes trashed tabs older than `days`; 0 means never.
+    func autoEmptyTrash(days: Int) {
+        guard days > 0 else { return }
+        let cutoff = now().addingTimeInterval(-TimeInterval(days) * 86_400)
+        for tab in trashedTabs where (tab.deletedAt ?? now()) < cutoff {
+            deletePermanently(id: tab.id)
+        }
+    }
+
+    /// Removes one version from history. The chain is repointed by the store;
+    /// a head that pointed at it moves to its parent so other devices can
+    /// still find our lineage.
+    func deleteVersion(id versionID: String, tabID: UUID) {
+        let tab = tabs.first { $0.id == tabID } ?? trashedTabs.first { $0.id == tabID }
+        let removed = versionStore.version(withID: versionID)
+        versionStore.delete(versionID: versionID, tabID: tabID, syncable: tab.map(versionSyncPolicy) ?? false)
+        if let index = tabs.firstIndex(where: { $0.id == tabID }), tabs[index].headVersionID == versionID {
+            tabs[index].headVersionID = removed?.parentID
+            if tabs[index].fileURL == nil {
+                cloudHooks.recordChanged(tabID)
+            }
+            scheduleSave()
+        } else if let index = trashedTabs.firstIndex(where: { $0.id == tabID }), trashedTabs[index].headVersionID == versionID {
+            trashedTabs[index].headVersionID = removed?.parentID
+            scheduleSave()
+        }
+        if versionTracking[tabID]?.latestText == removed?.text {
+            versionTracking[tabID]?.latestText = nil
+        }
+    }
+
+    private func forgetTracking(id: UUID) {
         cancelVersionTimers(id: id)
         versionTracking.removeValue(forKey: id)
         pendingExternalCursor.removeValue(forKey: id)
-        versionStore.deleteAll(tabID: id, syncable: syncVersions)
+        languageDetectWork[id]?.cancel()
+        languageDetectWork.removeValue(forKey: id)
+    }
 
-        if selectedTabID == id {
-            if tabs.isEmpty {
-                addNewTab()
-            } else {
-                let newIndex = min(index, tabs.count - 1)
-                selectedTabID = tabs[newIndex].id
-            }
+    /// Selection falls to the neighbour of a removed live tab; an empty list
+    /// gets a fresh tab.
+    private func reselectAfterRemoval(of id: UUID, at index: Int) {
+        if tabs.isEmpty {
+            addNewTab()
+        } else if selectedTabID == id {
+            selectedTabID = tabs[min(index, tabs.count - 1)].id
         }
-        scheduleSave()
     }
 
     func updateContent(id: UUID, content: String) {
@@ -278,7 +384,7 @@ class TabStore: ObservableObject {
         }
 
         if tab.fileURL == nil {
-            CloudSyncEngine.shared.recordChanged(id)
+            cloudHooks.recordChanged(id)
         }
 
         scheduleSave()
@@ -473,7 +579,7 @@ class TabStore: ObservableObject {
               tabs[index].headVersionID != versionID else { return }
         tabs[index].headVersionID = versionID
         if tabs[index].fileURL == nil {
-            CloudSyncEngine.shared.recordChanged(id)
+            cloudHooks.recordChanged(id)
         }
         scheduleSave()
     }
@@ -516,7 +622,7 @@ class TabStore: ObservableObject {
                 self.tabs[index].language = newLang
                 self.scheduleSave()
                 if self.tabs[index].fileURL == nil {
-                    CloudSyncEngine.shared.recordChanged(id)
+                    cloudHooks.recordChanged(id)
                 }
             }
         }
@@ -530,7 +636,7 @@ class TabStore: ObservableObject {
         tabs[index].languageLocked = true
         tabs[index].lastModified = Date()
         if tabs[index].fileURL == nil {
-            CloudSyncEngine.shared.recordChanged(id)
+            cloudHooks.recordChanged(id)
         }
         scheduleSave()
     }
@@ -694,6 +800,18 @@ class TabStore: ObservableObject {
     func applyCloudTab(_ data: CloudTabRecord) {
         lastICloudSync = Date()
 
+        if let deletedAt = data.deletedAt {
+            applyCloudTombstone(data, deletedAt: deletedAt)
+            return
+        }
+        if let trashedIndex = trashedTabs.firstIndex(where: { $0.id == data.id }) {
+            // Restored elsewhere: back to the live tabs, then the usual merge
+            var tab = trashedTabs.remove(at: trashedIndex)
+            tab.deletedAt = nil
+            tab.deletedOn = nil
+            tabs.append(tab)
+        }
+
         guard let localIndex = tabs.firstIndex(where: { $0.id == data.id }) else {
             let tab = TabData(
                 id: data.id,
@@ -725,6 +843,50 @@ class TabStore: ObservableObject {
         }
 
         mergeRemoteContent(data, at: localIndex)
+    }
+
+    /// A tombstone wins over local edits: the live text was snapshotted, so
+    /// nothing is lost by trashing the tab with its text as it stands.
+    private func applyCloudTombstone(_ data: CloudTabRecord, deletedAt: Date) {
+        let id = data.id
+        if let trashedIndex = trashedTabs.firstIndex(where: { $0.id == id }) {
+            trashedTabs[trashedIndex].deletedAt = deletedAt
+            trashedTabs[trashedIndex].deletedOn = data.deletedOn
+            if trashedTabs[trashedIndex].headVersionID == nil {
+                trashedTabs[trashedIndex].headVersionID = data.headVersionID
+            }
+            scheduleSave()
+            return
+        }
+
+        if let index = tabs.firstIndex(where: { $0.id == id }) {
+            commitHeldSnapshot(id: id)
+            snapshotIfChanged(id: id, source: .edit)
+            var tab = tabs[index]
+            tab.deletedAt = deletedAt
+            tab.deletedOn = data.deletedOn
+            tab.lastModified = max(tab.lastModified, data.lastModified)
+            trashedTabs.append(tab)
+            tabs.remove(at: index)
+            forgetTracking(id: id)
+            reselectAfterRemoval(of: id, at: index)
+            scheduleSave()
+            return
+        }
+
+        trashedTabs.append(TabData(
+            id: id,
+            name: data.name,
+            content: data.content,
+            language: data.language,
+            languageLocked: data.languageLocked,
+            isDirty: !data.content.isEmpty,
+            lastModified: data.lastModified,
+            headVersionID: data.headVersionID,
+            deletedAt: deletedAt,
+            deletedOn: data.deletedOn
+        ))
+        scheduleSave()
     }
 
     private func mergeRemoteContent(_ data: CloudTabRecord, at index: Int) {
@@ -776,7 +938,7 @@ class TabStore: ObservableObject {
             setLiveText(id: id, text: merged, headVersionID: version.id, at: index)
             tabs[index].lastModified = max(tabs[index].lastModified, data.lastModified)
             if merged != data.content, tabs[index].fileURL == nil {
-                CloudSyncEngine.shared.recordChanged(id)
+                cloudHooks.recordChanged(id)
             }
             scheduleSave()
             return
@@ -807,7 +969,7 @@ class TabStore: ObservableObject {
         tabs[index].hasConflict = true
         tabs[index].lastModified = max(tabs[index].lastModified, data.lastModified)
         if tabs[index].fileURL == nil {
-            CloudSyncEngine.shared.recordChanged(id)
+            cloudHooks.recordChanged(id)
         }
         scheduleSave()
     }
@@ -862,20 +1024,20 @@ class TabStore: ObservableObject {
         return nil
     }
 
+    /// A deleted ScratchTab record is a hard delete: the tab leaves the live
+    /// list or the trash and its history goes with it. The other device has
+    /// already queued the version deletions, so nothing is re-pushed.
     func removeCloudTab(id: UUID) {
-        guard let index = tabs.firstIndex(where: { $0.id == id }) else { return }
-        tabs.remove(at: index)
-
-        if selectedTabID == id {
-            if tabs.isEmpty {
-                addNewTab()
-            } else {
-                let newIndex = min(index, tabs.count - 1)
-                selectedTabID = tabs[newIndex].id
-            }
-        } else if tabs.isEmpty {
-            addNewTab()
+        if let index = trashedTabs.firstIndex(where: { $0.id == id }) {
+            trashedTabs.remove(at: index)
+        } else if let index = tabs.firstIndex(where: { $0.id == id }) {
+            tabs.remove(at: index)
+            forgetTracking(id: id)
+            reselectAfterRemoval(of: id, at: index)
+        } else {
+            return
         }
+        versionStore.deleteAll(tabID: id)
 
         lastICloudSync = Date()
         scheduleSave()

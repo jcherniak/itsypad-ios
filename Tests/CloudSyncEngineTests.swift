@@ -46,7 +46,19 @@ final class CloudSyncEngineTests: XCTestCase {
         XCTAssertEqual(parsed?.id, id)
         XCTAssertEqual(parsed?.content, "text")
         XCTAssertEqual(parsed?.headVersionID, "abc")
+        XCTAssertNil(parsed?.deletedAt)
+        XCTAssertNil(parsed?.deletedOn)
         XCTAssertNil(CloudSyncEngine.tabRecord(from: scratchTabRecord(id: id, content: "text", head: nil))?.headVersionID)
+    }
+
+    func testTabRecordParsesTombstone() {
+        let record = scratchTabRecord(id: UUID(), content: "text", head: nil)
+        let when = Date(timeIntervalSince1970: 1_800_000_000)
+        record["deletedAt"] = when as CKRecordValue
+        record["deletedOn"] = "Mac" as CKRecordValue
+        let parsed = CloudSyncEngine.tabRecord(from: record)
+        XCTAssertEqual(parsed?.deletedAt, when)
+        XCTAssertEqual(parsed?.deletedOn, "Mac")
     }
 
     // MARK: - resolveTabConflict
@@ -159,6 +171,23 @@ final class CloudSyncEngineTests: XCTestCase {
         XCTAssertEqual(store.tabs.first?.content, "a\nX")
         XCTAssertTrue(store.tabs.first!.hasConflict)
         XCTAssertTrue(store.versionStore.versions(for: tabID).contains { $0.text == "a\nY" && $0.source == .conflict })
+    }
+
+    func testResolveTabConflictAppliesServerTombstoneWithoutRePush() {
+        let (store, dir) = makeStore()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let engine = CloudSyncEngine(directoryURL: dir)
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "ours")
+
+        let server = scratchTabRecord(id: tabID, content: "ours", head: nil)
+        server["deletedAt"] = Date() as CKRecordValue
+        server["deletedOn"] = "Mac" as CKRecordValue
+        let local = CKRecord(recordType: "ScratchTab", recordID: server.recordID)
+        XCTAssertFalse(engine.resolveTabConflict(local: local, server: server, tabStore: store))
+        XCTAssertEqual(store.trashedTabs.map(\.id), [tabID])
+        XCTAssertEqual(store.trashedTabs.first?.deletedOn, "Mac")
+        XCTAssertFalse(store.tabs.contains { $0.id == tabID })
     }
 
     func testCloudTabRecordMutability() {

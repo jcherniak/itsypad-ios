@@ -188,6 +188,36 @@ final class VersionStoreTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: baseURL.appendingPathComponent("versions/\(tabA.uuidString).json").path))
     }
 
+    func testDeleteRepointsChildrenToTheDeletedVersionsParent() {
+        let a = version("a")
+        let b = version("b", parent: a.id, at: noon.addingTimeInterval(1))
+        let c = version("c", parent: b.id, at: noon.addingTimeInterval(2))
+        let d = version("d", parent: b.id, at: noon.addingTimeInterval(3))
+        for v in [a, b, c, d] { store.append(v) }
+
+        store.delete(versionID: b.id, tabID: tabA)
+        let remaining = store.versions(for: tabA)
+        XCTAssertEqual(remaining.map(\.id), [d.id, c.id, a.id])
+        XCTAssertEqual(remaining.first { $0.id == c.id }?.parentID, a.id)
+        XCTAssertEqual(remaining.first { $0.id == d.id }?.parentID, a.id)
+        XCTAssertNil(remaining.first { $0.id == a.id }?.parentID)
+
+        store.delete(versionID: a.id, tabID: tabA)
+        XCTAssertNil(store.versions(for: tabA).first { $0.id == c.id }?.parentID)
+    }
+
+    func testRemoveCloudRepointsChildren() {
+        let a = version("a")
+        let b = version("b", parent: a.id, at: noon.addingTimeInterval(1))
+        let c = version("c", parent: b.id, at: noon.addingTimeInterval(2))
+        for v in [a, b, c] { store.append(v) }
+
+        store.removeCloud(versionID: b.id)
+        XCTAssertEqual(store.versions(for: tabA).first { $0.id == c.id }?.parentID, a.id)
+        XCTAssertEqual(store.version(withID: c.id)?.parentID, a.id)
+        XCTAssertTrue(log.deleted.isEmpty)
+    }
+
     // MARK: - Cloud apply
 
     func testApplyCloudInsertsWithoutReupload() {

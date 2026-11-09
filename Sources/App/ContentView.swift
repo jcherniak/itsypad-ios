@@ -7,6 +7,7 @@ struct ContentView: View {
     @ObservedObject private var autoPaste = AutoPasteController.shared
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var showTabGrid = false
+    @State private var tabGridMode: TabGridView.Mode = .tabs
     @State private var showClipboard = false
     @State private var showSettings = false
     @State private var showVersionHistory = false
@@ -40,7 +41,7 @@ struct ContentView: View {
         }
         .animation(.spring(duration: 0.3), value: autoPaste.pending)
         .sheet(isPresented: $showTabGrid) {
-            TabGridView()
+            TabGridView(mode: tabGridMode)
                 .environmentObject(tabStore)
                 .environmentObject(settings)
         }
@@ -231,6 +232,13 @@ struct ContentView: View {
             .navigationTitle(String(localized: "tabs.title", defaultValue: "Tabs"))
             .toolbar {
                 ToolbarItemGroup(placement: .primaryAction) {
+                    Button {
+                        tabGridMode = .trash
+                        showTabGrid = true
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .accessibilityLabel(String(localized: "trash.title", defaultValue: "Trash"))
                     Button { tabStore.addNewTab() } label: {
                         Image(systemName: "plus")
                     }
@@ -323,7 +331,10 @@ struct ContentView: View {
             editorDetail
                 .toolbar {
                     ToolbarItemGroup(placement: .topBarLeading) {
-                        Button { showTabGrid = true } label: {
+                        Button {
+                            tabGridMode = .tabs
+                            showTabGrid = true
+                        } label: {
                             Image(systemName: "square.grid.2x2")
                         }
                         Button { showClipboard = true } label: {
