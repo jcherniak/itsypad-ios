@@ -27,6 +27,7 @@ final class CloudSyncEngine: @unchecked Sendable {
     enum RecordType: String {
         case scratchTab = "ScratchTab"
         case clipboardEntry = "ClipboardEntry"
+        case tabVersion = "TabVersion"
     }
 
     private static let containerID = "iCloud.com.nickustinov.itsypad"
@@ -159,6 +160,21 @@ final class CloudSyncEngine: @unchecked Sendable {
         engine.state.add(pendingRecordZoneChanges: [.deleteRecord(recordID)])
     }
 
+    /// Version records are keyed by their content hash, not a UUID.
+    func versionChanged(_ id: String) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let engine = syncEngine else { return }
+        let recordID = CKRecord.ID(recordName: id, zoneID: zoneID)
+        engine.state.add(pendingRecordZoneChanges: [.saveRecord(recordID)])
+    }
+
+    func versionDeleted(_ id: String) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let engine = syncEngine else { return }
+        let recordID = CKRecord.ID(recordName: id, zoneID: zoneID)
+        engine.state.add(pendingRecordZoneChanges: [.deleteRecord(recordID)])
+    }
+
     // MARK: - State persistence
 
     private func loadStateSerialization() -> CKSyncEngine.State.Serialization? {
@@ -258,6 +274,19 @@ final class CloudSyncEngine: @unchecked Sendable {
         return record
     }
 
+    private func buildTabVersionRecord(id: String, recordID: CKRecord.ID) -> CKRecord? {
+        guard let version = VersionStore.shared.version(withID: id) else { return nil }
+        let record = cachedRecord(for: recordID, recordType: RecordType.tabVersion.rawValue)
+        record["tabID"] = version.tabID.uuidString as CKRecordValue
+        record["parentID"] = version.parentID.map { $0 as CKRecordValue }
+        record["createdAt"] = version.createdAt as CKRecordValue
+        record["device"] = version.device as CKRecordValue
+        record["label"] = version.label.map { $0 as CKRecordValue }
+        record["text"] = version.text as CKRecordValue
+        record["source"] = version.source.rawValue as CKRecordValue
+        return record
+    }
+
     // MARK: - Incoming changes
 
     private func applyFetchedChanges(_ event: CKSyncEngine.Event.FetchedRecordZoneChanges) {
@@ -271,6 +300,8 @@ final class CloudSyncEngine: @unchecked Sendable {
                 applyScratchTabRecord(record)
             case RecordType.clipboardEntry.rawValue:
                 applyClipboardEntryRecord(record)
+            case RecordType.tabVersion.rawValue:
+                applyTabVersionRecord(record)
             default:
                 logger.warning("Unknown record type: \(record.recordType)")
             }
@@ -279,6 +310,11 @@ final class CloudSyncEngine: @unchecked Sendable {
         for deletion in event.deletions {
             let id = deletion.recordID.recordName
             removeRecordMetadata(for: deletion.recordID)
+
+            if deletion.recordType == RecordType.tabVersion.rawValue {
+                VersionStore.shared.removeCloud(versionID: id)
+                continue
+            }
 
             guard let uuid = UUID(uuidString: id) else { continue }
 
@@ -329,6 +365,30 @@ final class CloudSyncEngine: @unchecked Sendable {
         ClipboardStore.shared.applyCloudClipboardEntry(clipboardRecord)
     }
 
+    private func applyTabVersionRecord(_ record: CKRecord) {
+        guard let tabIDString = record["tabID"] as? String,
+              let tabID = UUID(uuidString: tabIDString),
+              let createdAt = record["createdAt"] as? Date,
+              let device = record["device"] as? String,
+              let text = record["text"] as? String,
+              let sourceRaw = record["source"] as? String else {
+            logger.error("Malformed TabVersion record: \(record.recordID)")
+            return
+        }
+        let version = TabVersion(
+            id: record.recordID.recordName,
+            tabID: tabID,
+            parentID: record["parentID"] as? String,
+            createdAt: createdAt,
+            device: device,
+            label: record["label"] as? String,
+            text: text,
+            source: TabVersion.Source(rawValue: sourceRaw) ?? .edit
+        )
+        logger.debug("applyTabVersion: id=\(version.id.prefix(8)) tab=\(tabID.uuidString.prefix(8))")
+        VersionStore.shared.applyCloud(version)
+    }
+
     // MARK: - Conflict resolution
 
     /// Returns true when the local version won and must be re-uploaded.
@@ -360,6 +420,12 @@ final class CloudSyncEngine: @unchecked Sendable {
         // Clipboard entries are append-only; server wins
         cacheRecordSystemFields(serverRecord)
         applyClipboardEntryRecord(serverRecord)
+    }
+
+    private func resolveVersionConflict(local record: CKRecord, server serverRecord: CKRecord) {
+        // Versions are immutable and content-addressed; server wins
+        cacheRecordSystemFields(serverRecord)
+        applyTabVersionRecord(serverRecord)
     }
 }
 
@@ -423,8 +489,13 @@ extension CloudSyncEngine: CKSyncEngineDelegate {
         let records: [CKRecord.ID: CKRecord] = await MainActor.run {
             var map = [CKRecord.ID: CKRecord]()
             for change in changes {
-                guard case .saveRecord(let recordID) = change,
-                      let uuid = UUID(uuidString: recordID.recordName) else { continue }
+                guard case .saveRecord(let recordID) = change else { continue }
+                guard let uuid = UUID(uuidString: recordID.recordName) else {
+                    if let record = buildTabVersionRecord(id: recordID.recordName, recordID: recordID) {
+                        map[recordID] = record
+                    }
+                    continue
+                }
                 if let record = buildScratchTabRecord(id: uuid, recordID: recordID)
                     ?? buildClipboardEntryRecord(id: uuid, recordID: recordID) {
                     map[recordID] = record
@@ -495,6 +566,8 @@ extension CloudSyncEngine: CKSyncEngineDelegate {
                 case RecordType.clipboardEntry.rawValue:
                     // Server wins, entries are immutable – nothing to re-push
                     resolveClipboardConflict(local: failedRecord, server: serverRecord)
+                case RecordType.tabVersion.rawValue:
+                    resolveVersionConflict(local: failedRecord, server: serverRecord)
                 default:
                     break
                 }
@@ -536,8 +609,13 @@ extension CloudSyncEngine: CKSyncEngineDelegate {
         let clipboardChanges: [CKSyncEngine.PendingRecordZoneChange] = ClipboardStore.shared.entries
             .map { .saveRecord(CKRecord.ID(recordName: $0.id.uuidString, zoneID: zoneID)) }
 
-        logger.info("Re-uploading \(tabChanges.count) tabs, \(clipboardChanges.count) clipboard entries")
-        syncEngine?.state.add(pendingRecordZoneChanges: tabChanges + clipboardChanges)
+        let versionChanges: [CKSyncEngine.PendingRecordZoneChange] = TabStore.shared.tabs
+            .filter { $0.fileURL == nil }
+            .flatMap { VersionStore.shared.versions(for: $0.id) }
+            .map { .saveRecord(CKRecord.ID(recordName: $0.id, zoneID: zoneID)) }
+
+        logger.info("Re-uploading \(tabChanges.count) tabs, \(clipboardChanges.count) clipboard entries, \(versionChanges.count) versions")
+        syncEngine?.state.add(pendingRecordZoneChanges: tabChanges + clipboardChanges + versionChanges)
     }
 
     private func clearLocalCloudState() {

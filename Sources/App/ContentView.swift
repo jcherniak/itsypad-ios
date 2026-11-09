@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var showTabGrid = false
     @State private var showClipboard = false
     @State private var showSettings = false
+    @State private var showVersionHistory = false
     @State private var showFileImporter = false
     @State private var showFileExporter = false
     @State private var showCloseConfirmation = false
@@ -42,6 +43,13 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView()
                 .environmentObject(settings)
+        }
+        .sheet(isPresented: $showVersionHistory) {
+            if let id = tabStore.selectedTabID {
+                VersionHistoryView(tabID: id, versionStore: tabStore.versionStore)
+                    .environmentObject(tabStore)
+                    .environmentObject(settings)
+            }
         }
         .fileImporter(
             isPresented: $showFileImporter,
@@ -151,6 +159,7 @@ struct ContentView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIScene.didEnterBackgroundNotification)) { _ in
+            tabStore.flushPendingVersions()
             tabStore.saveSession()
             CloudSyncEngine.shared.flushRecordMetadata()
         }
@@ -415,6 +424,11 @@ struct ContentView: View {
                 Label(String(localized: "menu.edit.numbered_list", defaultValue: "Numbered list"), systemImage: "list.number")
             }
             Divider()
+            Button {
+                showVersionHistory = true
+            } label: {
+                Label(String(localized: "menu.file.version_history", defaultValue: "Version history…"), systemImage: "clock.arrow.circlepath")
+            }
             Button {
                 showSettings = true
             } label: {
