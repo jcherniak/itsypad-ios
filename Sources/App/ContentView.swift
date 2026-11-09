@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @EnvironmentObject var tabStore: TabStore
     @EnvironmentObject var settings: SettingsStore
+    @ObservedObject private var autoPaste = AutoPasteController.shared
     @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var showTabGrid = false
     @State private var showClipboard = false
@@ -31,6 +32,13 @@ struct ContentView: View {
                 compactLayout
             }
         }
+        .overlay(alignment: .bottom) {
+            if let paste = autoPaste.pending {
+                autoPasteBanner(characterCount: paste.characterCount)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+        .animation(.spring(duration: 0.3), value: autoPaste.pending)
         .sheet(isPresented: $showTabGrid) {
             TabGridView()
                 .environmentObject(tabStore)
@@ -163,6 +171,26 @@ struct ContentView: View {
             tabStore.saveSession()
             CloudSyncEngine.shared.flushRecordMetadata()
         }
+    }
+
+    private func autoPasteBanner(characterCount: Int) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "doc.on.clipboard")
+                .foregroundStyle(.secondary)
+            Text(String(localized: "auto_paste.banner", defaultValue: "Pasted \(characterCount) characters"))
+                .font(.subheadline)
+                .lineLimit(1)
+            Button(String(localized: "auto_paste.undo", defaultValue: "Undo")) {
+                autoPaste.undo()
+            }
+            .font(.subheadline.weight(.semibold))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(Color.primary.opacity(0.1), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
+        .padding(.bottom, 12)
     }
 
     // MARK: - Regular layout (iPad)
