@@ -12,7 +12,7 @@ Both the macOS and iOS itsypad apps sync data via CloudKit using `CKSyncEngine` 
 
 | Record type | Fields | Notes |
 |---|---|---|
-| `ScratchTab` | `name` (String), `content` (String), `language` (String), `languageLocked` (Int64, 0/1), `lastModified` (Date), `headVersionID` (String, optional – id of the latest `TabVersion` the device appended for its live text) | recordName = tab UUID. `lastModified` is a display hint only; `headVersionID` drives conflict handling |
+| `ScratchTab` | `name` (String), `content` (String), `language` (String), `languageLocked` (Int64, 0/1), `lastModified` (Date), `headVersionID` (String, optional – id of the latest `TabVersion` the device appended for its live text), `deletedAt` (Date, optional), `deletedOn` (String, optional – device name) | recordName = tab UUID. `lastModified` is a display hint only; `headVersionID` drives conflict handling. A record with `deletedAt` is a tab in the trash; a CloudKit deletion of the record is a hard delete |
 | `ClipboardEntry` | `text` (String), `timestamp` (Date) | recordName = entry UUID |
 | `TabVersion` | `tabID` (String, tab UUID), `parentID` (String, optional), `createdAt` (Date), `device` (String), `label` (String, optional), `text` (String), `source` (String: `edit`, `paste`, `conflict`, `manual`, `restore`) | recordName = version id = lowercase hex SHA-256 of `tabID.uuidString + "\n" + text`. No `CKRecord.Reference` – closing a tab deletes its versions explicitly. Immutable, server wins on conflict |
 
@@ -105,6 +105,12 @@ struct CloudClipboardRecord {
 
 `TabVersion` records in a fetch batch are applied before `ScratchTab` records so the merge base is already local.
 
+### Trash and hard delete
+
+Closing a scratch tab is a soft delete: the tab moves to `TabStore.trashedTabs` with `deletedAt`/`deletedOn` set, keeps every version, and its `ScratchTab` record is re-saved as a tombstone. Other devices that fetch a record with `deletedAt` move the tab to their trash too (local edits are snapshotted first, so nothing is lost); a record whose `deletedAt` is nil again restores a locally trashed tab and then goes through the usual merge. Restore clears the tombstone and re-saves the record.
+
+Permanent deletion ("Delete now", "Empty trash", or the automatic emptying after `SettingsStore.trashAutoEmptyDays`) deletes every `TabVersion` record of the tab and then the `ScratchTab` record itself. A fetched `ScratchTab` deletion is therefore a hard delete: the tab is removed from the live tabs or the trash and `VersionStore.deleteAll` drops its history locally without queuing further deletions. Deleting a single version repoints its children to its parent, locally and when the deletion arrives from the cloud, so merge bases stay reachable.
+
 **Clipboard (server-wins):**
 - Clipboard entries are append-only – conflicts are rare
 - If same UUID conflicts: server wins
@@ -130,9 +136,11 @@ Local cache of `CKRecord` system fields (for conflict detection):
 | New scratch tab | `CloudSyncEngine.shared.recordChanged(id, type: .scratchTab)` |
 | Content update (scratch tab) | `CloudSyncEngine.shared.recordChanged(id, type: .scratchTab)` |
 | Language update (scratch tab) | `CloudSyncEngine.shared.recordChanged(id, type: .scratchTab)` |
-| Close scratch tab | `CloudSyncEngine.shared.recordDeleted(id, type: .scratchTab)` |
-| Incoming cloud tab | `TabStore.applyCloudTab(_ data: CloudTabRecord)` |
-| Incoming cloud deletion | `TabStore.removeCloudTab(id: UUID)` |
+| Close scratch tab (to trash) | `CloudSyncEngine.shared.recordChanged(id, type: .scratchTab)` – tombstone |
+| Restore from trash | `CloudSyncEngine.shared.recordChanged(id, type: .scratchTab)` |
+| Delete permanently / empty trash | `CloudSyncEngine.shared.versionDeleted` for each version, then `recordDeleted(id, type: .scratchTab)` |
+| Incoming cloud tab (live or tombstone) | `TabStore.applyCloudTab(_ data: CloudTabRecord)` |
+| Incoming cloud deletion (hard delete) | `TabStore.removeCloudTab(id: UUID)` |
 
 ### ClipboardStore
 

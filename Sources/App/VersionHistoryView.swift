@@ -6,6 +6,7 @@ struct VersionHistoryView: View {
     @EnvironmentObject var settings: SettingsStore
     @ObservedObject private var versionStore: VersionStore
     @Environment(\.dismiss) private var dismiss
+    @State private var pendingDeleteVersion: TabVersion?
 
     init(tabID: UUID, versionStore: VersionStore = .shared) {
         self.tabID = tabID
@@ -55,6 +56,12 @@ struct VersionHistoryView: View {
                                     } label: {
                                         VersionRow(version: version, previous: olderVersion(before: version))
                                     }
+                                    .contextMenu {
+                                        deleteButton(for: version)
+                                    }
+                                    .swipeActions(edge: .trailing) {
+                                        deleteButton(for: version)
+                                    }
                                 }
                             }
                         }
@@ -77,6 +84,33 @@ struct VersionHistoryView: View {
                     Button(String(localized: "common.done", defaultValue: "Done")) { dismiss() }
                 }
             }
+            .alert(
+                String(localized: "history.delete_version.confirm_title", defaultValue: "Delete this version?"),
+                isPresented: .init(
+                    get: { pendingDeleteVersion != nil },
+                    set: { if !$0 { pendingDeleteVersion = nil } }
+                )
+            ) {
+                Button(String(localized: "history.delete_version.confirm_delete", defaultValue: "Delete"), role: .destructive) {
+                    if let version = pendingDeleteVersion {
+                        tabStore.deleteVersion(id: version.id, tabID: tabID)
+                    }
+                    pendingDeleteVersion = nil
+                }
+                Button(String(localized: "history.name_version.cancel", defaultValue: "Cancel"), role: .cancel) {
+                    pendingDeleteVersion = nil
+                }
+            } message: {
+                Text(String(localized: "history.delete_version.confirm_message", defaultValue: "This cannot be undone."))
+            }
+        }
+    }
+
+    private func deleteButton(for version: TabVersion) -> some View {
+        Button(role: .destructive) {
+            pendingDeleteVersion = version
+        } label: {
+            Label(String(localized: "history.delete_version", defaultValue: "Delete version"), systemImage: "trash")
         }
     }
 

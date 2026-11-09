@@ -20,6 +20,7 @@ struct ItsypadApp: App {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
+                tabStore.autoEmptyTrash(days: settings.trashAutoEmptyDays)
                 CloudSyncEngine.shared.fetchChanges()
                 AutoPasteController.shared.handleAppOpened()
             } else if phase == .background {

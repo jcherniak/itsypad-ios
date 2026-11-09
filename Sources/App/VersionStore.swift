@@ -197,10 +197,7 @@ final class VersionStore: ObservableObject {
     }
 
     func delete(versionID: String, tabID: UUID, syncable: Bool = false) {
-        var list = load(tabID)
-        guard list.contains(where: { $0.id == versionID }) else { return }
-        list.removeAll { $0.id == versionID }
-        store(list, for: tabID)
+        guard remove(versionID: versionID, tabID: tabID) else { return }
         if syncable {
             cloudHooks.versionDeleted(versionID)
         }
@@ -248,13 +245,34 @@ final class VersionStore: ObservableObject {
 
     func removeCloud(versionID: String, tabID: UUID? = nil) {
         guard let tabID = tabID ?? version(withID: versionID)?.tabID else { return }
-        var list = load(tabID)
-        guard list.contains(where: { $0.id == versionID }) else { return }
-        list.removeAll { $0.id == versionID }
-        store(list, for: tabID)
+        remove(versionID: versionID, tabID: tabID)
     }
 
     // MARK: - Storage
+
+    /// Removing one version must not break the chain: its children are
+    /// repointed to its parent so merge bases stay reachable.
+    @discardableResult
+    private func remove(versionID: String, tabID: UUID) -> Bool {
+        var list = load(tabID)
+        guard let removed = list.first(where: { $0.id == versionID }) else { return false }
+        list.removeAll { $0.id == versionID }
+        list = list.map { v in
+            guard v.parentID == versionID else { return v }
+            return TabVersion(
+                id: v.id,
+                tabID: v.tabID,
+                parentID: removed.parentID,
+                createdAt: v.createdAt,
+                device: v.device,
+                label: v.label,
+                text: v.text,
+                source: v.source
+            )
+        }
+        store(list, for: tabID)
+        return true
+    }
 
     private func insert(_ v: TabVersion) -> Bool {
         var list = load(v.tabID)

@@ -1,11 +1,24 @@
 import XCTest
 @testable import ItsypadCore
 
+final class TabCloudLog {
+    var changed: [UUID] = []
+    var deleted: [UUID] = []
+
+    var hooks: TabStore.CloudHooks {
+        TabStore.CloudHooks(
+            recordChanged: { [unowned self] in self.changed.append($0) },
+            recordDeleted: { [unowned self] in self.deleted.append($0) }
+        )
+    }
+}
+
 final class TabStoreTests: XCTestCase {
     private var store: TabStore!
     private var tempURL: URL!
     private var versionsURL: URL!
     private var hookLog: VersionHookLog!
+    private var cloudLog: TabCloudLog!
     private var clock = Date(timeIntervalSince1970: 1_800_000_000)
 
     override func setUp() {
@@ -15,6 +28,7 @@ final class TabStoreTests: XCTestCase {
             .appendingPathExtension("json")
         versionsURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         hookLog = VersionHookLog()
+        cloudLog = TabCloudLog()
         store = TabStore(sessionURL: tempURL)
         configureVersioning(store)
     }
@@ -23,6 +37,7 @@ final class TabStoreTests: XCTestCase {
         let versionStore = VersionStore(baseURL: versionsURL)
         versionStore.cloudHooks = hookLog.hooks
         store.versionStore = versionStore
+        store.cloudHooks = cloudLog.hooks
         store.now = { [unowned self] in self.clock }
         store.deviceName = "Test phone"
         store.versionSyncPolicy = { $0.fileURL == nil }
@@ -1053,7 +1068,75 @@ final class TabStoreTests: XCTestCase {
         XCTAssertTrue(versions.isEmpty)
     }
 
-    func testCloseTabDeletesVersionsAndQueuesCloudDeletes() {
+    // MARK: - Trash
+
+    func testCloseScratchTabMovesItToTrashAndKeepsVersions() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "one")
+        store.fireIdleTimer(id: tabID)
+        clock.addTimeInterval(1)
+        store.updateContent(id: tabID, content: "one two")
+        store.fireIdleTimer(id: tabID)
+        XCTAssertEqual(store.versionStore.versions(for: tabID).count, 2)
+        cloudLog.changed.removeAll()
+
+        store.closeTab(id: tabID)
+        XCTAssertFalse(store.tabs.contains { $0.id == tabID })
+        XCTAssertEqual(store.trashedTabs.map(\.id), [tabID])
+        XCTAssertEqual(store.trashedTabs.first?.content, "one two")
+        XCTAssertEqual(store.trashedTabs.first?.deletedAt, clock)
+        XCTAssertEqual(store.trashedTabs.first?.deletedOn, "Test phone")
+        XCTAssertEqual(store.versionStore.versions(for: tabID).count, 2)
+        XCTAssertTrue(hookLog.deleted.isEmpty)
+        XCTAssertEqual(cloudLog.changed.first, tabID)
+        XCTAssertTrue(cloudLog.deleted.isEmpty)
+        XCTAssertEqual(store.tabs.count, 1)
+    }
+
+    func testCloseScratchTabSnapshotsUnsavedTextFirst() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "typed")
+
+        store.closeTab(id: tabID)
+        XCTAssertEqual(store.versionStore.versions(for: tabID).map(\.text), ["typed"])
+        XCTAssertEqual(store.trashedTabs.first?.headVersionID, TabVersion.makeID(tabID: tabID, text: "typed"))
+    }
+
+    func testCloseFileBackedTabIsNotTrashedAndDeletesVersionsLocallyOnly() {
+        let tabID = store.tabs.first!.id
+        store.tabs[0].fileURL = URL(fileURLWithPath: "/tmp/notes.txt")
+        store.updateContent(id: tabID, content: "file text")
+        store.fireIdleTimer(id: tabID)
+        XCTAssertEqual(store.versionStore.versions(for: tabID).count, 1)
+        XCTAssertTrue(hookLog.changed.isEmpty)
+        cloudLog.changed.removeAll()
+
+        store.closeTab(id: tabID)
+        XCTAssertTrue(store.trashedTabs.isEmpty)
+        XCTAssertTrue(store.versionStore.versions(for: tabID).isEmpty)
+        XCTAssertTrue(hookLog.deleted.isEmpty)
+        XCTAssertFalse(cloudLog.changed.contains(tabID))
+        XCTAssertTrue(cloudLog.deleted.isEmpty)
+    }
+
+    func testRestoreFromTrashClearsTombstoneAndSelects() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "keep me")
+        store.closeTab(id: tabID)
+        cloudLog.changed.removeAll()
+
+        store.restoreFromTrash(id: tabID)
+        XCTAssertTrue(store.trashedTabs.isEmpty)
+        let tab = store.tabs.first { $0.id == tabID }
+        XCTAssertEqual(tab?.content, "keep me")
+        XCTAssertNil(tab?.deletedAt)
+        XCTAssertNil(tab?.deletedOn)
+        XCTAssertEqual(store.selectedTabID, tabID)
+        XCTAssertEqual(cloudLog.changed, [tabID])
+        XCTAssertEqual(store.versionStore.versions(for: tabID).map(\.text), ["keep me"])
+    }
+
+    func testDeletePermanentlyRemovesVersionsAndQueuesCloudDeletes() {
         let tabID = store.tabs.first!.id
         store.updateContent(id: tabID, content: "one")
         store.fireIdleTimer(id: tabID)
@@ -1062,23 +1145,179 @@ final class TabStoreTests: XCTestCase {
         store.fireIdleTimer(id: tabID)
         let ids = Set(store.versionStore.versions(for: tabID).map(\.id))
         XCTAssertEqual(ids.count, 2)
-
         store.closeTab(id: tabID)
+
+        store.deletePermanently(id: tabID)
+        XCTAssertTrue(store.trashedTabs.isEmpty)
         XCTAssertTrue(store.versionStore.versions(for: tabID).isEmpty)
         XCTAssertEqual(Set(hookLog.deleted), ids)
+        XCTAssertEqual(cloudLog.deleted, [tabID])
     }
 
-    func testCloseFileBackedTabDeletesVersionsLocallyOnly() {
-        let tabID = store.tabs.first!.id
-        store.tabs[0].fileURL = URL(fileURLWithPath: "/tmp/notes.txt")
-        store.updateContent(id: tabID, content: "file text")
-        store.fireIdleTimer(id: tabID)
-        XCTAssertEqual(store.versionStore.versions(for: tabID).count, 1)
-        XCTAssertTrue(hookLog.changed.isEmpty)
+    func testDeletePermanentlyOnLiveTabReselectsNeighbor() {
+        let first = store.tabs.first!.id
+        store.addNewTab()
+        let second = store.tabs[1].id
+        store.selectedTabID = first
 
+        store.deletePermanently(id: first)
+        XCTAssertEqual(store.tabs.map(\.id), [second])
+        XCTAssertEqual(store.selectedTabID, second)
+        XCTAssertEqual(cloudLog.deleted, [first])
+    }
+
+    func testEmptyTrashDeletesEveryTrashedTab() {
+        let a = store.tabs.first!.id
+        store.updateContent(id: a, content: "a")
+        store.fireIdleTimer(id: a)
+        store.closeTab(id: a)
+        let b = store.tabs.first!.id
+        store.updateContent(id: b, content: "b")
+        store.fireIdleTimer(id: b)
+        store.closeTab(id: b)
+        XCTAssertEqual(store.trashedTabs.count, 2)
+
+        store.emptyTrash()
+        XCTAssertTrue(store.trashedTabs.isEmpty)
+        XCTAssertTrue(store.versionStore.versions(for: a).isEmpty)
+        XCTAssertTrue(store.versionStore.versions(for: b).isEmpty)
+        XCTAssertEqual(Set(cloudLog.deleted), [a, b])
+        XCTAssertEqual(hookLog.deleted.count, 2)
+    }
+
+    func testAutoEmptyTrashRespectsDaysAndZeroIsNever() {
+        let old = store.tabs.first!.id
+        store.closeTab(id: old)
+        clock.addTimeInterval(40 * 86_400)
+        let recent = store.tabs.first!.id
+        store.closeTab(id: recent)
+        clock.addTimeInterval(86_400)
+
+        store.autoEmptyTrash(days: 0)
+        XCTAssertEqual(store.trashedTabs.count, 2)
+
+        store.autoEmptyTrash(days: 30)
+        XCTAssertEqual(store.trashedTabs.map(\.id), [recent])
+        XCTAssertEqual(cloudLog.deleted, [old])
+    }
+
+    func testApplyCloudTombstoneTrashesLiveTabAndSnapshotsEdits() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "local edit")
+        var record = remote("remote text", head: nil)
+        record.deletedAt = clock.addingTimeInterval(-5)
+        record.deletedOn = "Mac"
+
+        store.applyCloudTab(record)
+        XCTAssertFalse(store.tabs.contains { $0.id == tabID })
+        XCTAssertEqual(store.trashedTabs.map(\.id), [tabID])
+        XCTAssertEqual(store.trashedTabs.first?.content, "local edit")
+        XCTAssertEqual(store.trashedTabs.first?.deletedAt, record.deletedAt)
+        XCTAssertEqual(store.trashedTabs.first?.deletedOn, "Mac")
+        XCTAssertTrue(store.versionStore.versions(for: tabID).contains { $0.text == "local edit" })
+        XCTAssertEqual(store.tabs.count, 1)
+        XCTAssertNotEqual(store.selectedTabID, tabID)
+    }
+
+    func testApplyCloudTombstoneForUnknownTabAddsItToTrash() {
+        let record = CloudTabRecord(
+            id: UUID(),
+            name: "Gone",
+            content: "bye",
+            language: "plain",
+            languageLocked: false,
+            lastModified: clock,
+            headVersionID: nil,
+            deletedAt: clock,
+            deletedOn: "Mac"
+        )
+        store.applyCloudTab(record)
+        XCTAssertEqual(store.trashedTabs.map(\.name), ["Gone"])
+        XCTAssertEqual(store.trashedTabs.first?.deletedOn, "Mac")
+        XCTAssertEqual(store.tabs.count, 1)
+    }
+
+    func testApplyCloudLiveRecordRestoresTrashedTab() {
+        let tabID = store.tabs.first!.id
+        let head = snapshot("shared")
         store.closeTab(id: tabID)
+        XCTAssertEqual(store.trashedTabs.count, 1)
+
+        let record = CloudTabRecord(
+            id: tabID,
+            name: "Back",
+            content: "shared",
+            language: "plain",
+            languageLocked: false,
+            lastModified: Date().addingTimeInterval(100),
+            headVersionID: head
+        )
+        store.applyCloudTab(record)
+        XCTAssertTrue(store.trashedTabs.isEmpty)
+        let tab = store.tabs.first { $0.id == tabID }
+        XCTAssertNil(tab?.deletedAt)
+        XCTAssertNil(tab?.deletedOn)
+        XCTAssertEqual(tab?.name, "Back")
+        XCTAssertEqual(tab?.content, "shared")
+    }
+
+    func testRemoveCloudTabHardDeletesTrashedTabAndItsVersions() {
+        let tabID = store.tabs.first!.id
+        snapshot("doomed")
+        store.closeTab(id: tabID)
+        hookLog.deleted.removeAll()
+
+        store.removeCloudTab(id: tabID)
+        XCTAssertTrue(store.trashedTabs.isEmpty)
         XCTAssertTrue(store.versionStore.versions(for: tabID).isEmpty)
         XCTAssertTrue(hookLog.deleted.isEmpty)
+        XCTAssertTrue(cloudLog.deleted.isEmpty)
+    }
+
+    func testRemoveCloudTabHardDeletesLiveTabVersions() {
+        let tabID = store.tabs.first!.id
+        snapshot("live")
+
+        store.removeCloudTab(id: tabID)
+        XCTAssertFalse(store.tabs.contains { $0.id == tabID })
+        XCTAssertTrue(store.versionStore.versions(for: tabID).isEmpty)
+        XCTAssertEqual(store.tabs.count, 1)
+    }
+
+    func testSessionRoundTripAfterTrashing() {
+        let tabID = store.tabs.first!.id
+        store.updateContent(id: tabID, content: "binned")
+        store.closeTab(id: tabID)
+        store.saveSession()
+
+        let restored = TabStore(sessionURL: tempURL)
+        XCTAssertEqual(restored.trashedTabs.map(\.id), [tabID])
+        XCTAssertEqual(restored.trashedTabs.first?.content, "binned")
+        XCTAssertEqual(restored.trashedTabs.first?.deletedAt, clock)
+        XCTAssertEqual(restored.trashedTabs.first?.deletedOn, "Test phone")
+        XCTAssertFalse(restored.tabs.contains { $0.id == tabID })
+    }
+
+    func testDeleteVersionRepointsChildAndHead() {
+        let tabID = store.tabs.first!.id
+        let a = snapshot("a")
+        let b = snapshot("a\nb")
+        let c = snapshot("a\nb\nc")
+        XCTAssertEqual(store.tabs.first?.headVersionID, c)
+        hookLog.deleted.removeAll()
+        cloudLog.changed.removeAll()
+
+        store.deleteVersion(id: b, tabID: tabID)
+        let remaining = store.versionStore.versions(for: tabID)
+        XCTAssertEqual(remaining.map(\.id), [c, a])
+        XCTAssertEqual(remaining.first?.parentID, a)
+        XCTAssertEqual(hookLog.deleted, [b])
+        XCTAssertEqual(store.tabs.first?.headVersionID, c)
+        XCTAssertTrue(cloudLog.changed.isEmpty)
+
+        store.deleteVersion(id: c, tabID: tabID)
+        XCTAssertEqual(store.tabs.first?.headVersionID, a)
+        XCTAssertEqual(cloudLog.changed, [tabID])
     }
 
     func testSetVersionLabelGoesThroughStore() {
