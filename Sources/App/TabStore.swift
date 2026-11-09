@@ -84,6 +84,10 @@ class TabStore: ObservableObject {
     var idleInterval: TimeInterval = 3
     var holdInterval: TimeInterval = 10
     var deviceName: String = TabVersion.currentDeviceName
+    var historySettings: () -> (enabled: Bool, keepCount: Int, keepDays: Int) = {
+        let s = SettingsStore.shared
+        return (s.versionHistoryEnabled, s.versionKeepCount, s.versionKeepDays)
+    }
     var versionSyncPolicy: (TabData) -> Bool = { $0.fileURL == nil && SettingsStore.shared.icloudSync }
 
     private struct VersionTracking {
@@ -270,6 +274,7 @@ class TabStore: ObservableObject {
     /// `holdInterval` elapses.
     func recordEdit(id: UUID, content: String, source: TabVersion.Source = .edit, hold: Bool = false) {
         guard tabs.contains(where: { $0.id == id }) else { return }
+        guard historySettings().enabled else { return }
         if !hold {
             commitHeldSnapshot(id: id)
         }
@@ -319,7 +324,7 @@ class TabStore: ObservableObject {
         versionTracking[id] = tracking
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         if versionStore.append(held, syncable: versionSyncPolicy(tab)) {
-            versionStore.prune(tabID: id, now: now(), syncable: versionSyncPolicy(tab))
+            pruneVersions(id: id, syncable: versionSyncPolicy(tab))
         }
     }
 
@@ -384,6 +389,7 @@ class TabStore: ObservableObject {
 
     private func snapshotIfChanged(id: UUID, source: TabVersion.Source) {
         cancelIdleTimer(id: id)
+        guard historySettings().enabled else { return }
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         guard tab.content != latestText(for: id) else { return }
         writeVersion(id: id, text: tab.content, source: source)
@@ -406,8 +412,13 @@ class TabStore: ObservableObject {
         versionTracking[id, default: VersionTracking()].latestText = text
         let syncable = versionSyncPolicy(tab)
         if versionStore.append(version, syncable: syncable) {
-            versionStore.prune(tabID: id, now: now(), syncable: syncable)
+            pruneVersions(id: id, syncable: syncable)
         }
+    }
+
+    private func pruneVersions(id: UUID, syncable: Bool) {
+        let config = historySettings()
+        versionStore.prune(tabID: id, now: now(), keepCount: config.keepCount, keepDays: config.keepDays, syncable: syncable)
     }
 
     private func cancelIdleTimer(id: UUID) {

@@ -58,7 +58,14 @@ struct VersionPrunePolicy {
     /// Keep everything from the last hour, one per 10-minute bucket between
     /// 1 h and 24 h, one per calendar day beyond that, at most `hardCap`.
     /// The first, the latest and every labelled version are never dropped.
-    static func idsToDrop(versions: [TabVersion], now: Date, calendar: Calendar = .current) -> [String] {
+    /// `keepCount` and `keepDays` of 0 mean unlimited.
+    static func idsToDrop(
+        versions: [TabVersion],
+        now: Date,
+        keepCount: Int = hardCap,
+        keepDays: Int = 0,
+        calendar: Calendar = .current
+    ) -> [String] {
         let ordered = versions.sorted { $0.createdAt < $1.createdAt }
         guard ordered.count > 2 else { return [] }
 
@@ -93,9 +100,16 @@ struct VersionPrunePolicy {
             }
         }
 
+        if keepDays > 0 {
+            let cutoff = TimeInterval(keepDays) * 86_400
+            for v in ordered where now.timeIntervalSince(v.createdAt) > cutoff && !protected.contains(v.id) {
+                drop.insert(v.id)
+            }
+        }
+
         var remaining = ordered.count - drop.count
-        if remaining > hardCap {
-            for v in ordered where remaining > hardCap && !drop.contains(v.id) && !protected.contains(v.id) {
+        if keepCount > 0, remaining > keepCount {
+            for v in ordered where remaining > keepCount && !drop.contains(v.id) && !protected.contains(v.id) {
                 drop.insert(v.id)
                 remaining -= 1
             }
@@ -202,9 +216,15 @@ final class VersionStore: ObservableObject {
         }
     }
 
-    func prune(tabID: UUID, now: Date = Date(), syncable: Bool = false) {
+    func prune(
+        tabID: UUID,
+        now: Date = Date(),
+        keepCount: Int = VersionPrunePolicy.hardCap,
+        keepDays: Int = 0,
+        syncable: Bool = false
+    ) {
         let list = load(tabID)
-        let drop = VersionPrunePolicy.idsToDrop(versions: list, now: now)
+        let drop = VersionPrunePolicy.idsToDrop(versions: list, now: now, keepCount: keepCount, keepDays: keepDays)
         guard !drop.isEmpty else { return }
         let dropSet = Set(drop)
         store(list.filter { !dropSet.contains($0.id) }, for: tabID)

@@ -26,6 +26,7 @@ final class TabStoreTests: XCTestCase {
         store.now = { [unowned self] in self.clock }
         store.deviceName = "Test phone"
         store.versionSyncPolicy = { $0.fileURL == nil }
+        store.historySettings = { (true, 200, 90) }
     }
 
     override func tearDown() {
@@ -873,5 +874,31 @@ final class TabStoreTests: XCTestCase {
         store.setVersionLabel("Milestone", versionID: id, tabID: tabID)
         XCTAssertEqual(versions.first?.label, "Milestone")
         XCTAssertEqual(hookLog.changed, [id])
+    }
+
+    func testRecordEditIsNoOpWhenHistoryDisabled() {
+        let tabID = store.tabs.first!.id
+        store.historySettings = { (false, 200, 90) }
+        store.updateContent(id: tabID, content: String(repeating: "x", count: 500))
+        store.fireIdleTimer(id: tabID)
+        store.flushPendingVersions()
+        XCTAssertTrue(versions.isEmpty)
+
+        store.historySettings = { (true, 200, 90) }
+        store.updateContent(id: tabID, content: String(repeating: "y", count: 500))
+        store.fireIdleTimer(id: tabID)
+        XCTAssertEqual(versions.count, 1)
+    }
+
+    func testHistoryKeepCountIsAppliedOnAppend() {
+        let tabID = store.tabs.first!.id
+        store.historySettings = { (true, 3, 0) }
+        for i in 0..<6 {
+            clock = clock.addingTimeInterval(1)
+            store.updateContent(id: tabID, content: "text \(i)")
+            store.fireIdleTimer(id: tabID)
+        }
+        XCTAssertEqual(versions.count, 3)
+        XCTAssertEqual(versions.first?.text, "text 5")
     }
 }

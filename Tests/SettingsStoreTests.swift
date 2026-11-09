@@ -163,4 +163,39 @@ final class SettingsStoreTests: XCTestCase {
 
         preDefaults.removePersistentDomain(forName: preSuiteName)
     }
+
+    // MARK: - History settings
+
+    func testHistorySettingsDefaults() {
+        XCTAssertTrue(store.versionHistoryEnabled)
+        XCTAssertEqual(store.versionKeepCount, 200)
+        XCTAssertEqual(store.versionKeepDays, 90)
+        XCTAssertEqual(store.trashAutoEmptyDays, 30)
+    }
+
+    func testHistorySettingsPersistToDefaults() {
+        store.versionHistoryEnabled = false
+        store.versionKeepCount = 50
+        store.versionKeepDays = 0
+        store.trashAutoEmptyDays = 7
+        XCTAssertFalse(defaults.bool(forKey: "versionHistoryEnabled"))
+        XCTAssertEqual(defaults.integer(forKey: "versionKeepCount"), 50)
+        XCTAssertEqual(defaults.object(forKey: "versionKeepDays") as? Int, 0)
+        XCTAssertEqual(defaults.integer(forKey: "trashAutoEmptyDays"), 7)
+    }
+
+    func testHistorySettingsLoadFromPrePopulatedDefaults() {
+        let suite = "com.nickustinov.itsypad.test.\(UUID().uuidString)"
+        let d = UserDefaults(suiteName: suite)!
+        defer { d.removePersistentDomain(forName: suite) }
+        d.set(false, forKey: "versionHistoryEnabled")
+        d.set(500, forKey: "versionKeepCount")
+        d.set(0, forKey: "versionKeepDays")
+        d.set(0, forKey: "trashAutoEmptyDays")
+        let loaded = SettingsStore(defaults: d)
+        XCTAssertFalse(loaded.versionHistoryEnabled)
+        XCTAssertEqual(loaded.versionKeepCount, 500)
+        XCTAssertEqual(loaded.versionKeepDays, 0)
+        XCTAssertEqual(loaded.trashAutoEmptyDays, 0)
+    }
 }
