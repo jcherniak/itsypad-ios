@@ -6,6 +6,9 @@
 - Add version history – versions are saved automatically while you type, synced via iCloud, and can be compared as a diff and restored
 - Add auto-paste on open – inserts the clipboard into the current note when Itsypad opens, with a one-tap undo banner
 - Add launch behaviour setting – reopen the last note or start a new note
+- Sync no longer discards edits: local text is saved to history before remote changes apply, non-overlapping edits merge, conflicts keep both
+- Trash for closed notes with restore, permanent delete and automatic emptying
+- History settings: keep count, keep days, trash auto-empty
 
 ## 1.2.1
 
