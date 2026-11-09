@@ -149,6 +149,38 @@ class SettingsStore: ObservableObject {
         }
     }
 
+    @Published var versionHistoryEnabled: Bool = true {
+        didSet {
+            guard !isLoading else { return }
+            defaults.set(versionHistoryEnabled, forKey: "versionHistoryEnabled")
+            NotificationCenter.default.post(name: .settingsChanged, object: nil)
+        }
+    }
+
+    @Published var versionKeepCount: Int = 200 {
+        didSet {
+            guard !isLoading else { return }
+            defaults.set(versionKeepCount, forKey: "versionKeepCount")
+            NotificationCenter.default.post(name: .settingsChanged, object: nil)
+        }
+    }
+
+    @Published var versionKeepDays: Int = 90 {
+        didSet {
+            guard !isLoading else { return }
+            defaults.set(versionKeepDays, forKey: "versionKeepDays")
+            NotificationCenter.default.post(name: .settingsChanged, object: nil)
+        }
+    }
+
+    @Published var trashAutoEmptyDays: Int = 30 {
+        didSet {
+            guard !isLoading else { return }
+            defaults.set(trashAutoEmptyDays, forKey: "trashAutoEmptyDays")
+            NotificationCenter.default.post(name: .settingsChanged, object: nil)
+        }
+    }
+
     @Published var icloudSync: Bool = true
 
     func setICloudSync(_ enabled: Bool) {
@@ -197,5 +229,9 @@ class SettingsStore: ObservableObject {
         icloudSync = defaults.object(forKey: "icloudSync") as? Bool ?? true
         launchBehavior = defaults.string(forKey: "launchBehavior").flatMap(LaunchBehavior.init(rawValue:)) ?? .reopenLast
         autoPasteOnOpen = defaults.object(forKey: "autoPasteOnOpen") as? Bool ?? false
+        versionHistoryEnabled = defaults.object(forKey: "versionHistoryEnabled") as? Bool ?? true
+        versionKeepCount = defaults.object(forKey: "versionKeepCount") as? Int ?? 200
+        versionKeepDays = defaults.object(forKey: "versionKeepDays") as? Int ?? 90
+        trashAutoEmptyDays = defaults.object(forKey: "trashAutoEmptyDays") as? Int ?? 30
     }
 }

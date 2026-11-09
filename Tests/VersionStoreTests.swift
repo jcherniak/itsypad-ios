@@ -305,4 +305,36 @@ final class VersionStoreTests: XCTestCase {
         XCTAssertEqual(Set(store.versions(for: tabA).map(\.id)), [first.id, dupB.id, latest.id])
         XCTAssertEqual(log.deleted, [dupA.id])
     }
+
+    func testPruneKeepCountLimitsAndProtectsFirstLatestLabelled() {
+        let versions = (0..<10).map { i in
+            version("v\(i)", at: noon.addingTimeInterval(-Double(9 - i)), label: i == 3 ? "keep" : nil)
+        }
+        let drop = VersionPrunePolicy.idsToDrop(versions: versions, now: noon, keepCount: 4, keepDays: 0, calendar: utc)
+        XCTAssertEqual(drop.count, 6)
+        XCTAssertFalse(drop.contains(versions[0].id))
+        XCTAssertFalse(drop.contains(versions[3].id))
+        XCTAssertFalse(drop.contains(versions[9].id))
+        XCTAssertEqual(Set(drop), Set([1, 2, 4, 5, 6, 7].map { versions[$0].id }))
+    }
+
+    func testPruneKeepCountZeroIsUnlimited() {
+        let versions = (0..<250).map { i in
+            version("v\(i)", at: noon.addingTimeInterval(-Double(249 - i)))
+        }
+        XCTAssertTrue(VersionPrunePolicy.idsToDrop(versions: versions, now: noon, keepCount: 0, keepDays: 0, calendar: utc).isEmpty)
+    }
+
+    func testPruneKeepDaysDropsOldUnprotected() {
+        let day = 86_400.0
+        let first = version("first", at: noon.addingTimeInterval(-100 * day))
+        let old = version("old", at: noon.addingTimeInterval(-50 * day))
+        let oldLabelled = version("oldL", at: noon.addingTimeInterval(-40 * day), label: "named")
+        let recent = version("recent", at: noon.addingTimeInterval(-5 * day))
+        let latest = version("latest", at: noon)
+        let all = [first, old, oldLabelled, recent, latest]
+        let drop = VersionPrunePolicy.idsToDrop(versions: all, now: noon, keepCount: 0, keepDays: 30, calendar: utc)
+        XCTAssertEqual(drop, [old.id])
+        XCTAssertTrue(VersionPrunePolicy.idsToDrop(versions: all, now: noon, keepCount: 0, keepDays: 0, calendar: utc).isEmpty)
+    }
 }

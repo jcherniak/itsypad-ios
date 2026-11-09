@@ -35,6 +35,33 @@ struct SettingsView: View {
                     Text(String(localized: "settings.launch.auto_paste_footer", defaultValue: "Inserts the clipboard into the current note when Itsypad opens. A banner lets you undo it with one tap."))
                 }
 
+                Section {
+                    Toggle(String(localized: "settings.history.enabled", defaultValue: "Save version history"), isOn: $settings.versionHistoryEnabled)
+
+                    Picker(String(localized: "settings.history.keep_count", defaultValue: "Keep versions"), selection: $settings.versionKeepCount) {
+                        Text(String(localized: "settings.history.unlimited", defaultValue: "Unlimited")).tag(0)
+                        ForEach([50, 100, 200, 500], id: \.self) { Text("\($0)").tag($0) }
+                    }
+
+                    Picker(String(localized: "settings.history.keep_days", defaultValue: "Keep for"), selection: $settings.versionKeepDays) {
+                        Text(String(localized: "settings.history.unlimited", defaultValue: "Unlimited")).tag(0)
+                        ForEach([7, 30, 90, 365], id: \.self) { days in
+                            Text(String(localized: "settings.history.days", defaultValue: "\(days) days")).tag(days)
+                        }
+                    }
+
+                    Picker(String(localized: "settings.history.trash_auto_empty", defaultValue: "Empty trash after"), selection: $settings.trashAutoEmptyDays) {
+                        Text(String(localized: "settings.history.never", defaultValue: "Never")).tag(0)
+                        ForEach([7, 30, 90], id: \.self) { days in
+                            Text(String(localized: "settings.history.days", defaultValue: "\(days) days")).tag(days)
+                        }
+                    }
+                } header: {
+                    Text(String(localized: "settings.history.title", defaultValue: "History"))
+                } footer: {
+                    Text(String(localized: "settings.history.footer", defaultValue: "Versions are saved automatically while you type and synced with iCloud. The first, latest and named versions are always kept."))
+                }
+
                 Section(String(localized: "settings.appearance.title", defaultValue: "Appearance")) {
                     Picker(String(localized: "settings.appearance.mode", defaultValue: "Mode"), selection: $settings.appearanceOverride) {
                         Text(String(localized: "settings.appearance.system", defaultValue: "System")).tag("system")
