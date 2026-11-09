@@ -1,6 +1,6 @@
 name: itsypad-ios
 options:
-  bundleIdPrefix: com.nickustinov
+  bundleIdPrefix: com.justinc
   deploymentTarget:
     iOS: "17.0"
   xcodeVersion: "16.0"
@@ -22,7 +22,7 @@ options:
 
 settings:
   base:
-    DEVELOPMENT_TEAM: R892A93W42
+    DEVELOPMENT_TEAM: RV54K9ZH64
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: "Apple Development"
 
@@ -35,6 +35,7 @@ targets:
         excludes:
           - Info.plist
           - itsypad-ios.entitlements
+          - itsypad-ios-debug.entitlements
     info:
       path: Sources/Info.plist
       properties:
@@ -57,7 +58,7 @@ targets:
           - UIInterfaceOrientationLandscapeRight
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.nickustinov.itsypad
+        PRODUCT_BUNDLE_IDENTIFIER: com.justinc.itsypad
         PRODUCT_NAME: Itsypad
         PRODUCT_MODULE_NAME: ItsypadCore
         MARKETING_VERSION: "1.2.1"
@@ -71,6 +72,9 @@ targets:
         SWIFT_EMIT_LOC_STRINGS: "YES"
         INFOPLIST_KEY_CFBundleDisplayName: Itsypad
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.productivity
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: Sources/itsypad-ios-debug.entitlements
 
   ItsypadTests:
     type: bundle.unit-test
