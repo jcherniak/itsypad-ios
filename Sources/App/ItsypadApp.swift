@@ -21,6 +21,9 @@ struct ItsypadApp: App {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 CloudSyncEngine.shared.fetchChanges()
+                AutoPasteController.shared.handleAppOpened()
+            } else if phase == .background {
+                AutoPasteController.shared.dismiss()
             }
         }
     }

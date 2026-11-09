@@ -212,10 +212,13 @@ class TabStore: ObservableObject {
     /// Content set by something other than typing (version restore, auto-paste
     /// without a live text view). Does not snapshot: the caller has already
     /// recorded whatever version it needs. The cursor is picked up once by
-    /// EditorView via takePendingExternalCursor.
-    func setContentExternally(id: UUID, content: String, cursor: Int) {
+    /// EditorView via takePendingExternalCursor; pass nil when a live text
+    /// view already holds the new text and caret.
+    func setContentExternally(id: UUID, content: String, cursor: Int?) {
         cancelIdleTimer(id: id)
-        pendingExternalCursor[id] = min(max(cursor, 0), content.utf16.count)
+        if let cursor {
+            pendingExternalCursor[id] = min(max(cursor, 0), content.utf16.count)
+        }
         applyContent(id: id, content: content)
     }
 
